@@ -1,0 +1,10 @@
+import sqlite3
+conn = sqlite3.connect('bot.db')
+c = conn.cursor()
+c.execute('SELECT name FROM sqlite_master WHERE type="table"')
+print('Tables:', c.fetchall())
+c.execute('PRAGMA table_info(users)')
+print('Users columns:', c.fetchall())
+c.execute('PRAGMA table_info(history)')
+print('History columns:', c.fetchall())
+conn.close()
