@@ -8,14 +8,11 @@ import requests
 logger = logging.getLogger(__name__)
 
 API_URL = "https://api.dictionaryapi.dev/api/v2/entries/en/"
-Menu=[ "📊 Statistikangiz","🕘 Tarix"," 🗑 Tarixni tozalash","❓ Yordam"
 
-
-]
 
 def getDefinitions(word: str) -> Optional[dict]:
     """
-    English so'z haqida to'liq ma'lumot oladi.
+    English so'z haqida to'liq ma'lumot oladi (dictionaryapi.dev bepul API).
 
     Returns:
         {

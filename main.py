@@ -1,14 +1,12 @@
 import asyncio
 import html
-import inspect
 import io
 import logging
 import os
 import random
-import sqlite3
-import tempfile
-from datetime import datetime
-from pathlib import Path
+import re
+import signal
+import sys
 
 # .env faylini yuklash
 try:
@@ -18,7 +16,8 @@ except ImportError:
     pass
 
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.enums import ParseMode, ContentType
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import (
@@ -27,7 +26,6 @@ from aiogram.types import (
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    ReplyKeyboardRemove,
     CallbackQuery,
     BotCommand,
     BotCommandScopeDefault,
@@ -38,22 +36,42 @@ from oxfordLookup import getDefinitions
 from test_data import TEST_QUESTIONS, TEST_LANG_NAMES
 from alphabet_data import ALPHABET_DATA
 
+# Ma'lumotlar ombori — JSON fayllar (data/users.json, data/history.json)
+from storage import (
+    init_storage,
+    autosave_loop,
+    flush as flush_storage,
+    register_user,
+    set_user_lang,
+    get_user_lang,
+    increment_search,
+    save_history,
+    get_user_stats,
+    get_history,
+    clear_history,
+    count_users,
+)
+
 import requests
-from deep_translator import GoogleTranslator
 
-import numpy as np
+# ------------------------------------------------------------
+# OCR (rasmdan matn o'qish) — ixtiyoriy kutubxonalar.
+# Birortasi o'rnatilmagan bo'lsa ham bot ishlayveradi, faqat
+# rasm tarjimasi o'chib turadi.
+# ------------------------------------------------------------
 
-# OCR uchun
 try:
     from PIL import Image
 except ImportError:
     Image = None
 
 try:
+    import numpy as np
     from rapidocr_onnxruntime import RapidOCR
     rapid_ocr_engine = RapidOCR()
     RAPID_OCR_AVAILABLE = True
 except Exception:
+    np = None
     rapid_ocr_engine = None
     RAPID_OCR_AVAILABLE = False
 
@@ -64,17 +82,22 @@ except Exception:
     pytesseract = None
     PYTESSERACT_AVAILABLE = False
 
-OCR_AVAILABLE = RAPID_OCR_AVAILABLE or PYTESSERACT_AVAILABLE or True
+# OCR.space onlayn zaxira faqat API kalit bo'lsa ishlaydi
+OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY")
+
+# Rasmdan matn o'qish umuman mumkinmi?
+OCR_AVAILABLE = RAPID_OCR_AVAILABLE or PYTESSERACT_AVAILABLE or bool(OCR_SPACE_API_KEY)
 
 # Rasm tarjimalari matnlari kesh (boshqa tilga qayta tarjima qilish uchun)
 photo_text_cache: dict[int, str] = {}
+PHOTO_CACHE_LIMIT = 500
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-API_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("Bot") or os.getenv("BOT")
+API_TOKEN = (os.getenv("BOT_TOKEN") or os.getenv("BOT") or "").strip()
 
 if not API_TOKEN:
     raise ValueError(
@@ -89,12 +112,20 @@ if not API_TOKEN:
     )
 
 
-DB_NAME = "bot.db"
+# Telegram bitta xabarda 4096 belgidan ko'pini qabul qilmaydi
+TELEGRAM_MESSAGE_LIMIT = 4096
 
 
 # ============================================================
 # LOGGING
 # ============================================================
+
+# Windows konsolida emoji log yozuvlari xato bermasligi uchun UTF-8 ga o'tkazamiz
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -122,23 +153,137 @@ bot = Bot(
 
 dp = Dispatcher()
 
-# Translator Helper
-def get_translator(source: str = "auto", target: str = "uz"):
-    try:
-        from deep_translator import GoogleTranslator
-        return GoogleTranslator(source=source, target=target)
-    except Exception:
-        return None
+
+# ============================================================
+# TIL NOMLARI (bitta manba — hamma joyda shu ishlatiladi)
+# ============================================================
+
+LANG_NAMES = {
+    "auto": "🔄 Avtomatik",
+    "uz": "🇺🇿 O'zbekcha",
+    "en": "🇬🇧 English",
+    "ru": "🇷🇺 Русский",
+    "ko": "🇰🇷 한국어 (Koreys)",
+    "tr": "🇹🇷 Türkçe (Turk)",
+}
+
+
+def lang_title(code: str) -> str:
+    """Til kodini ('uz', 'en', ...) chiroyli nomga aylantiradi."""
+    return LANG_NAMES.get(code, LANG_NAMES["auto"])
 
 
 # ============================================================
-# USER TARGET LANGUAGE SETTING
+# SESSIYALAR (xotirada — bot qayta ishga tushsa tozalanadi)
 # ============================================================
 
-user_target_lang = {}
 user_test_sessions = {}
 user_test_setup = {}
 user_math_sessions = {}
+user_test_locks = {}
+
+
+# ============================================================
+# XABAR YUBORISH YORDAMCHILARI
+# ============================================================
+
+def split_long_text(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
+    """Uzun matnni Telegram chegarasiga sig'adigan bo'laklarga bo'ladi."""
+    if len(text) <= limit:
+        return [text]
+
+    parts: list[str] = []
+    current = ""
+
+    for line in text.split("\n"):
+        # Bitta satrning o'zi chegaradan uzun bo'lsa, majburan kesamiz
+        while len(line) > limit:
+            if current:
+                parts.append(current)
+                current = ""
+            parts.append(line[:limit])
+            line = line[limit:]
+
+        if len(current) + len(line) + 1 > limit:
+            parts.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+
+    if current:
+        parts.append(current)
+
+    return parts
+
+
+def strip_html(text: str) -> str:
+    """HTML teglarini olib tashlab, oddiy matn qoldiradi."""
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
+def is_html_error(error: Exception) -> bool:
+    """Xato HTML (parse_mode) bilan bog'liqmi?"""
+    message = str(error).lower()
+    return "can't parse entities" in message or "unsupported start tag" in message
+
+
+async def answer_safe(message: types.Message, text: str, **kwargs):
+    """
+    Xabar yuboradi; HTML xatosi bo'lsa, oddiy matn sifatida qayta yuboradi.
+
+    Bu himoya savol/alifbo matnlariga xato HTML tushib qolsa ham
+    foydalanuvchi xabarsiz qolmasligi uchun kerak.
+    (Ma'lumotlarni oldindan tekshirish uchun: python validate_data.py)
+    """
+    try:
+        await message.answer(text, **kwargs)
+    except TelegramBadRequest as error:
+        if not is_html_error(error):
+            raise
+        logger.warning("HTML xatosi — oddiy matn sifatida yuborilmoqda: %s", error)
+        await message.answer(strip_html(text), parse_mode=None, **kwargs)
+
+
+async def answer_long(message: types.Message, text: str, **kwargs):
+    """Uzun matnni bir nechta xabarga bo'lib yuboradi (klaviatura oxirgisida)."""
+    parts = split_long_text(text)
+
+    for index, part in enumerate(parts):
+        is_last = index == len(parts) - 1
+        await answer_safe(message, part, **(kwargs if is_last else {}))
+
+
+async def safe_edit_text(callback: CallbackQuery, text: str, **kwargs) -> None:
+    """
+    Xabarni tahrirlaydi.
+
+    Ikkita tipik Telegram xatosini o'zi hal qiladi:
+      • "message is not modified" — matn o'zgarmagan bo'lsa, e'tiborsiz qoldiriladi;
+      • "can't parse entities" — HTML buzuq bo'lsa, oddiy matn sifatida yuboriladi.
+    """
+    # Uzun matnni satr chegarasi bo'yicha kesamiz — HTML teg o'rtasidan kesilmasin
+    safe_text = split_long_text(text)[0]
+
+    try:
+        await callback.message.edit_text(safe_text, **kwargs)
+        return
+    except TelegramBadRequest as error:
+        if "message is not modified" in str(error).lower():
+            return
+
+        if is_html_error(error):
+            logger.warning("HTML xatosi — oddiy matn sifatida tahrirlanmoqda: %s", error)
+            try:
+                await callback.message.edit_text(
+                    strip_html(safe_text), parse_mode=None, **kwargs
+                )
+                return
+            except TelegramBadRequest as second_error:
+                error = second_error
+
+        logger.warning("Xabarni tahrirlab bo'lmadi: %s", error)
+
+    await answer_safe(callback.message, safe_text, **kwargs)
 
 
 # ============================================================
@@ -587,12 +732,6 @@ def generate_math_problem_with_options():
     }
 
 
-def generate_math_problem():
-    """Moslik uchun eski funksiya."""
-    data = generate_math_problem_with_options()
-    return data["problem"], data["answer"]
-
-
 # ============================================================
 # QUIZ SAVOLLARI (20 ta — EN/UZ/RU)
 # ============================================================
@@ -752,7 +891,7 @@ QUIZ_QUESTIONS = [
         "savol": "🇬🇧 'Brave' (jasur) so'zining antonimi qaysi?",
         "variantlar": ["Strong", "Cowardly", "Smart", "Kind"],
         "javob": 1,
-        "tushuntirish": "Brave (jasur) <-> Cowardly (qo'rqoq)."
+        "tushuntirish": "Brave (jasur) ↔ Cowardly (qo'rqoq)."
     },
     {
         "savol": "🇬🇧 'Piece of cake' idiomasining asl ma'nosi nima?",
@@ -961,249 +1100,6 @@ QUIZ_QUESTIONS = [
 ]
 
 
-# ============================================================
-# DATABASE
-# ============================================================
-
-def init_database():
-
-    connection = sqlite3.connect(DB_NAME)
-
-    cursor = connection.cursor()
-    cursor.execute("PRAGMA journal_mode=WAL;")
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            full_name TEXT,
-            searches INTEGER DEFAULT 0,
-            target_lang TEXT DEFAULT 'auto',
-            created_at TEXT
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            text TEXT,
-            result TEXT,
-            created_at TEXT
-        )
-    """)
-
-    # Agar eski jadvalda target_lang ustuni bo'lmasa, qo'shamiz
-    try:
-        cursor.execute("ALTER TABLE users ADD COLUMN target_lang TEXT DEFAULT 'auto'")
-    except sqlite3.OperationalError:
-        pass  # Ustun allaqachon mavjud
-
-    connection.commit()
-    connection.close()
-
-
-def register_user(
-    user_id: int,
-    username: str,
-    full_name: str
-):
-
-    connection = sqlite3.connect(DB_NAME)
-
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        INSERT OR IGNORE INTO users
-        (
-            user_id,
-            username,
-            full_name,
-            searches,
-            target_lang,
-            created_at
-        )
-        VALUES (?, ?, ?, 0, 'auto', ?)
-        """,
-        (
-            user_id,
-            username,
-            full_name,
-            datetime.now().isoformat()
-        )
-    )
-
-    connection.commit()
-    connection.close()
-
-
-def set_user_lang(user_id: int, lang: str):
-
-    connection = sqlite3.connect(DB_NAME)
-    cursor = connection.cursor()
-
-    cursor.execute(
-        "UPDATE users SET target_lang = ? WHERE user_id = ?",
-        (lang, user_id)
-    )
-
-    connection.commit()
-    connection.close()
-
-    user_target_lang[user_id] = lang
-
-
-def get_user_lang(user_id: int) -> str:
-
-    if user_id in user_target_lang:
-        return user_target_lang[user_id]
-
-    connection = sqlite3.connect(DB_NAME)
-    cursor = connection.cursor()
-
-    cursor.execute(
-        "SELECT target_lang FROM users WHERE user_id = ?",
-        (user_id,)
-    )
-
-    row = cursor.fetchone()
-    connection.close()
-
-    lang = row[0] if row and row[0] else "auto"
-    user_target_lang[user_id] = lang
-
-    return lang
-
-
-def increment_search(user_id: int):
-
-    connection = sqlite3.connect(DB_NAME)
-
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        UPDATE users
-        SET searches = searches + 1
-        WHERE user_id = ?
-        """,
-        (user_id,)
-    )
-
-    connection.commit()
-    connection.close()
-
-
-def save_history(
-    user_id: int,
-    text: str,
-    result: str
-):
-
-    connection = sqlite3.connect(DB_NAME)
-
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        INSERT INTO history
-        (
-            user_id,
-            text,
-            result,
-            created_at
-        )
-        VALUES (?, ?, ?, ?)
-        """,
-        (
-            user_id,
-            text,
-            result,
-            datetime.now().isoformat()
-        )
-    )
-
-    connection.commit()
-    connection.close()
-
-
-def get_user_stats(user_id: int):
-
-    connection = sqlite3.connect(DB_NAME)
-
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT searches
-        FROM users
-        WHERE user_id = ?
-        """,
-        (user_id,)
-    )
-
-    row = cursor.fetchone()
-
-    cursor.execute(
-        """
-        SELECT COUNT(*)
-        FROM history
-        WHERE user_id = ?
-        """,
-        (user_id,)
-    )
-
-    history_count = cursor.fetchone()[0]
-
-    connection.close()
-
-    searches = row[0] if row else 0
-
-    return searches, history_count
-
-
-def get_history(user_id: int, limit=10):
-
-    connection = sqlite3.connect(DB_NAME)
-
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT text, result
-        FROM history
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (user_id, limit)
-    )
-
-    rows = cursor.fetchall()
-
-    connection.close()
-
-    return rows
-
-
-def clear_history(user_id: int):
-
-    connection = sqlite3.connect(DB_NAME)
-
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        DELETE FROM history
-        WHERE user_id = ?
-        """,
-        (user_id,)
-    )
-
-    connection.commit()
-    connection.close()
-
 
 # ============================================================
 # MULTI-ENGINE TRANSLATOR (googletrans + deep_translator + MyMemory)
@@ -1216,10 +1112,9 @@ except Exception:
     _gt_translator = None
 
 try:
-    from deep_translator import GoogleTranslator as DeepGoogleTranslator, MyMemoryTranslator
+    from deep_translator import GoogleTranslator as DeepGoogleTranslator
 except Exception:
     DeepGoogleTranslator = None
-    MyMemoryTranslator = None
 
 try:
     from langdetect import detect as langdetect_detect
@@ -1227,9 +1122,20 @@ except Exception:
     langdetect_detect = None
 
 
+# O'zbek tiliga xos so'zlar (butun so'z sifatida qidiriladi)
+UZ_WORD_MARKERS = {
+    "va", "bu", "men", "sen", "siz", "biz", "ular", "emas", "uchun", "bilan",
+    "ham", "yoki", "lekin", "qanday", "nima", "qayerda", "kerak", "bor",
+    "salom", "rahmat", "yaxshi", "juda", "hozir", "keyin", "bugun", "ertaga",
+    "maktab", "kitob", "bola", "yosh", "yil", "kun",
+}
+
+# O'zbek kirill alifbosiga xos belgilar (rus tilida uchramaydi)
+UZ_CYRILLIC_CHARS = "ўқғҳЎҚҒҲ"
+
+
 def _detect_script_heuristic(text: str) -> str | None:
     """Belgilar to'plami bo'yicha tezkor tilni aniqlash."""
-    import re
     # Koreyscha
     if re.search(r"[\uac00-\ud7a3]", text):
         return "ko"
@@ -1239,14 +1145,22 @@ def _detect_script_heuristic(text: str) -> str | None:
     # Yaponcha
     if re.search(r"[\u3040-\u30ff]", text):
         return "ja"
-    # Kirillcha (Ruscha yoki O'zbek kirillcha)
+    # Kirillcha: o'zbek kirillini rus tilidan ajratamiz
     if re.search(r"[\u0400-\u04ff]", text):
+        if any(char in text for char in UZ_CYRILLIC_CHARS):
+            return "uz"
         return "ru"
-    # O'zbekcha lotiniga xos belgilar/so'zlar
-    uz_markers = ["o‘", "o'", "g‘", "g'", "sh", "ch", " emas", " va ", " uchun", " bilan", " bu ", " men ", " siz "]
-    lower_text = " " + text.lower() + " "
-    if any(m in lower_text for m in uz_markers):
+    # O'zbek lotiniga xos apostrofli harflar: o', g'
+    if re.search(r"[oOgG]['\u2018\u2019`]", text):
         return "uz"
+
+    # Butun so'z sifatida uchraydigan o'zbekcha markerlar.
+    # ("sh" / "ch" kabi harf birikmalari ingliz so'zlarida ham uchraydi,
+    #  shuning uchun ular marker sifatida ishlatilmaydi.)
+    words = set(re.findall(r"[a-z'\u2018\u2019`]+", text.lower()))
+    if words & UZ_WORD_MARKERS:
+        return "uz"
+
     return None
 
 
@@ -1437,6 +1351,23 @@ async def translator_translate(
     return DummyTranslated(text)
 
 
+def choose_destination(src_lang: str, user_pref: str) -> str:
+    """
+    Tarjima maqsad tilini tanlaydi.
+
+    • Foydalanuvchi aniq til tanlagan bo'lsa — o'sha til ishlatiladi.
+      Agar matn allaqachon shu tilda bo'lsa, teskari yo'nalish tanlanadi
+      (aks holda tarjima natijasi asl matnning o'zi bo'lib qolardi).
+    • "auto" rejimida: o'zbekcha matn → inglizchaga, qolgani → o'zbekchaga.
+    """
+    if user_pref and user_pref != "auto":
+        if src_lang != user_pref:
+            return user_pref
+        return "en" if user_pref == "uz" else "uz"
+
+    return "en" if src_lang == "uz" else "uz"
+
+
 # ============================================================
 # INLINE KEYBOARDS
 # ============================================================
@@ -1578,28 +1509,79 @@ def get_test_answer_keyboard(options):
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
-def get_quiz_keyboard():
-    """Quiz kategoriyalari Reply Keyboard (60 ta savol)."""
-    return ReplyKeyboardMarkup(
-        keyboard=[
+def get_main_menu_inline_keyboard():
+    """Asosiy menyu Inline Keyboard (edit_text / callback xabarlar uchun)."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
             [
-                KeyboardButton(text="🎲 Tasodifiy savol"),
+                InlineKeyboardButton(text="🌐 Tarjima tili", callback_data="menu_lang"),
+                InlineKeyboardButton(text="📚 Kutubxona", callback_data="menu_kutubxona"),
             ],
             [
-                KeyboardButton(text="🔤 So'z tarjimasi (1-12)"),
-                KeyboardButton(text="📖 Grammatika (13-24)"),
+                InlineKeyboardButton(text="🎲 Quiz / Savol", callback_data="menu_quiz"),
+                InlineKeyboardButton(text="🧮 Matematik", callback_data="menu_matematik"),
             ],
             [
-                KeyboardButton(text="📚 So'z boyligi (25-36)"),
-                KeyboardButton(text="🧠 Mantiqiy savollar (37-48)"),
+                InlineKeyboardButton(text="💡 Fakt", callback_data="menu_fakt"),
+                InlineKeyboardButton(text="🔥 Motivatsiya", callback_data="menu_motivatsiya"),
             ],
             [
-                KeyboardButton(text="🌍 Dunyoqarash & Fan (49-60)"),
-                KeyboardButton(text="⬅️ Asosiy menyu"),
+                InlineKeyboardButton(text="🌤 Ob-havo", callback_data="menu_obhavo"),
+                InlineKeyboardButton(text="📷 Rasm tarjima", callback_data="menu_photo"),
             ],
-        ],
-        resize_keyboard=True,
+            [
+                InlineKeyboardButton(text="📊 Statistika", callback_data="menu_stats"),
+                InlineKeyboardButton(text="🕘 Tarix", callback_data="menu_history"),
+            ],
+            [
+                InlineKeyboardButton(text="❓ Yordam", callback_data="menu_help"),
+            ],
+        ]
     )
+
+
+def get_quiz_keyboard():
+    """Quiz kategoriyalari Reply Keyboard (QUIZ_CATEGORIES asosida quriladi)."""
+    labels = [
+        f"{name} ({start + 1}-{end})"
+        for name, start, end in QUIZ_CATEGORIES.values()
+    ]
+
+    keyboard = [[KeyboardButton(text="🎲 Tasodifiy savol")]]
+    for i in range(0, len(labels), 2):
+        keyboard.append([KeyboardButton(text=label) for label in labels[i:i + 2]])
+    keyboard.append([KeyboardButton(text="⬅️ Asosiy menyu")])
+
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+
+# Quiz kategoriyalari: kalit -> (nom, boshlanish indeksi, tugash indeksi)
+QUIZ_CATEGORIES = {
+    "words": ("🔤 So'z tarjimasi", 0, 12),
+    "grammar": ("📖 Grammatika", 12, 24),
+    "vocab": ("📚 So'z boyligi", 24, 36),
+    "logic": ("🧠 Mantiqiy savollar", 36, 48),
+    "world": ("🌍 Dunyoqarash & Fan", 48, 60),
+}
+
+
+def get_quiz_inline_keyboard():
+    """Quiz kategoriyalari Inline Keyboard (edit_text uchun)."""
+    rows = [[InlineKeyboardButton(text="🎲 Tasodifiy savol", callback_data="quiz_random")]]
+
+    keys = list(QUIZ_CATEGORIES)
+    for i in range(0, len(keys), 2):
+        row = [
+            InlineKeyboardButton(
+                text=f"{QUIZ_CATEGORIES[key][0]} ({QUIZ_CATEGORIES[key][1] + 1}-{QUIZ_CATEGORIES[key][2]})",
+                callback_data=f"quiz_cat_{key}",
+            )
+            for key in keys[i:i + 2]
+        ]
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton(text="🏠 Menyu", callback_data="back_main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def get_lang_keyboard():
@@ -1687,45 +1669,32 @@ WEATHER_CITY_MAP = {
 
 
 def get_weather_keyboard():
-    """Ob-havo viloyatlari (12 ta viloyat + Nukus) Reply Keyboard."""
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton(text="🏙 Toshkent"),
-                KeyboardButton(text="🕌 Samarqand"),
-            ],
-            [
-                KeyboardButton(text="🏛 Buxoro"),
-                KeyboardButton(text="🏔 Andijon"),
-            ],
-            [
-                KeyboardButton(text="🍇 Farg'ona"),
-                KeyboardButton(text="🌸 Namangan"),
-            ],
-            [
-                KeyboardButton(text="🌾 Qashqadaryo"),
-                KeyboardButton(text="☀️ Surxondaryo"),
-            ],
-            [
-                KeyboardButton(text="🌲 Jizzax"),
-                KeyboardButton(text="🌊 Sirdaryo"),
-            ],
-            [
-                KeyboardButton(text="🏰 Xorazm"),
-                KeyboardButton(text="⛏ Navoiy"),
-            ],
-            [
-                KeyboardButton(text="🏜 Qoraqalpog'iston"),
-                KeyboardButton(text="⬅️ Asosiy menyu"),
-            ],
-        ],
-        resize_keyboard=True,
-    )
+    """Ob-havo shaharlari Reply Keyboard (WEATHER_CITY_MAP asosida quriladi)."""
+    cities = list(WEATHER_CITY_MAP.keys())
+    rows = [cities[i:i + 2] for i in range(0, len(cities), 2)]
+    keyboard = [[KeyboardButton(text=name) for name in row] for row in rows]
+    keyboard.append([KeyboardButton(text="⬅️ Asosiy menyu")])
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 
-def get_back_button(callback_data="back_main"):
-    """Orqaga tugmasi (Reply)."""
-    return get_main_menu_keyboard()
+def get_weather_inline_keyboard():
+    """Ob-havo shaharlari Inline Keyboard (callback: weather_<city>)."""
+    cities = list(WEATHER_CITY_MAP.items())
+    rows = []
+
+    for i in range(0, len(cities), 2):
+        rows.append([
+            InlineKeyboardButton(text=name, callback_data=f"weather_{code}")
+            for name, code in cities[i:i + 2]
+        ])
+
+    rows.append([
+        InlineKeyboardButton(text="🌤 @Obb_hovo_Bot", url="https://t.me/Obb_hovo_Bot")
+    ])
+    rows.append([
+        InlineKeyboardButton(text="🏠 Asosiy menyu", callback_data="back_main")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ============================================================
@@ -1783,8 +1752,13 @@ async def menu_command(message: types.Message):
 
     await message.answer(
         "📋 <b>ASOSIY MENYU</b>\n\n"
-        "Kerakli bo'limni tanlang:",
+        "Kerakli bo'limni pastdagi tugmalardan tanlang:",
         reply_markup=get_main_menu_keyboard()
+    )
+
+    await message.answer(
+        "⚡️ <b>Tezkor menyu:</b>",
+        reply_markup=get_main_menu_inline_keyboard()
     )
 
 
@@ -1792,12 +1766,7 @@ async def menu_command(message: types.Message):
 # /help
 # ============================================================
 
-@dp.message(Command("help"))
-async def help_command(
-    message: types.Message
-):
-
-    await message.answer(
+HELP_TEXT = (
         "📚 <b>BOTDAN FOYDALANISH</b>\n\n"
 
         "1️⃣ <b>Tarjima</b>\n"
@@ -1836,7 +1805,13 @@ async def help_command(
         "📊 /stats — Statistika\n"
         "🕘 /history — Tarix\n"
         "🗑 /clear — Tarixni tozalash"
-    )
+)
+
+
+@dp.message(Command("help"))
+async def help_command(message: types.Message):
+
+    await message.answer(HELP_TEXT, reply_markup=get_main_menu_keyboard())
 
 
 # ============================================================
@@ -1846,16 +1821,7 @@ async def help_command(
 @dp.message(Command("lang"))
 async def lang_command(message: types.Message):
 
-    current = get_user_lang(message.from_user.id)
-    lang_names = {
-        "auto": "🔄 Avtomatik",
-        "uz": "🇺🇿 O'zbekcha",
-        "en": "🇬🇧 English",
-        "ru": "🇷🇺 Русский",
-        "ko": "🇰🇷 한국어 (Koreys)",
-        "tr": "🇹🇷 Türkçe (Turk)",
-    }
-    current_name = lang_names.get(current, "🔄 Avtomatik")
+    current_name = lang_title(get_user_lang(message.from_user.id))
 
     await message.answer(
         "🌐 <b>TIL SOZLAMALARI</b>\n\n"
@@ -1875,30 +1841,49 @@ async def lang_command(message: types.Message):
 # /stats
 # ============================================================
 
-@dp.message(Command("stats"))
-async def stats_command(
-    message: types.Message
-):
+def build_stats_text(user_id: int) -> str:
+    """Foydalanuvchi statistikasi matni."""
+    searches, history_count = get_user_stats(user_id)
 
-    searches, history_count = get_user_stats(
-        message.from_user.id
-    )
-
-    current = get_user_lang(message.from_user.id)
-    lang_names = {
-        "auto": "🔄 Avtomatik",
-        "uz": "🇺🇿 O'zbekcha",
-        "en": "🇬🇧 English",
-        "ru": "🇷🇺 Русский",
-    }
-
-    await message.answer(
+    return (
         "📊 <b>SIZNING STATISTIKANGIZ</b>\n\n"
-
         f"🔎 Qidiruvlar: <b>{searches}</b>\n"
         f"🕘 Tarixdagi yozuvlar: <b>{history_count}</b>\n"
-        f"🌐 Tarjima tili: <b>{lang_names.get(current, 'Avtomatik')}</b>"
+        f"🌐 Tarjima tili: <b>{lang_title(get_user_lang(user_id))}</b>\n"
+        f"👥 Botdagi foydalanuvchilar: <b>{count_users()}</b>"
     )
+
+
+def build_history_text(user_id: int, limit: int = 10) -> str:
+    """Oxirgi tarjimalar tarixi matni."""
+    rows = get_history(user_id, limit)
+
+    if not rows:
+        return (
+            "🕘 <b>TARIX BO'SH</b>\n\n"
+            "Hozircha qidiruv tarixingiz yo'q.\n"
+            "Menga so'z yoki gap yuboring — tarjima qilib, shu yerga saqlab qo'yaman."
+        )
+
+    text = "🕘 <b>OXIRGI QIDIRUVLAR</b>\n\n"
+
+    for index, row in enumerate(rows, start=1):
+        created = (row.get("created_at") or "")[:16].replace("T", " ")
+        text += (
+            f"<b>{index}.</b> {html.escape(row['text'][:120])}\n"
+            f"→ {html.escape(row['result'][:120])}\n"
+        )
+        if created:
+            text += f"<i>🕓 {created}</i>\n"
+        text += "\n"
+
+    return text
+
+
+@dp.message(Command("stats"))
+async def stats_command(message: types.Message):
+
+    await message.answer(build_stats_text(message.from_user.id))
 
 
 # ============================================================
@@ -1906,36 +1891,9 @@ async def stats_command(
 # ============================================================
 
 @dp.message(Command("history"))
-async def history_command(
-    message: types.Message
-):
+async def history_command(message: types.Message):
 
-    rows = get_history(
-        message.from_user.id
-    )
-
-    if not rows:
-
-        await message.answer(
-            "🕘 Hozircha qidiruv tarixingiz bo'sh."
-        )
-
-        return
-
-    text = "🕘 <b>OXIRGI QIDIRUVLAR</b>\n\n"
-
-    for index, (query, result) in enumerate(
-        rows,
-        start=1
-    ):
-
-        text += (
-            f"<b>{index}.</b> "
-            f"{html.escape(query)}\n"
-            f"→ {html.escape(result[:100])}\n\n"
-        )
-
-    await message.answer(text)
+    await answer_long(message, build_history_text(message.from_user.id))
 
 
 # ============================================================
@@ -1943,17 +1901,14 @@ async def history_command(
 # ============================================================
 
 @dp.message(Command("clear"))
-async def clear_command(
-    message: types.Message
-):
+async def clear_command(message: types.Message):
 
-    clear_history(
-        message.from_user.id
-    )
+    removed = clear_history(message.from_user.id)
 
-    await message.answer(
-        "🗑 <b>Tarix tozalandi.</b>"
-    )
+    if removed:
+        await message.answer(f"🗑 <b>Tarix tozalandi.</b>\n\n{removed} ta yozuv o'chirildi.")
+    else:
+        await message.answer("🕘 Tarixingiz allaqachon bo'sh edi.")
 
 
 # ============================================================
@@ -1977,11 +1932,8 @@ async def kutubxona_command(message: types.Message):
 @dp.message(Command("fakt"))
 async def fakt_command(message: types.Message):
 
-    fakt = random.choice(FAKTLAR)
-
     await message.answer(
-        "💡 <b>QIZIQARLI FAKT</b>\n\n"
-        f"{fakt}",
+        build_fakt_text(),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💡 Yana fakt!", callback_data="menu_fakt")],
             [InlineKeyboardButton(text="⬅️ Menyu", callback_data="back_main")],
@@ -1996,14 +1948,8 @@ async def fakt_command(message: types.Message):
 @dp.message(Command("motivatsiya"))
 async def motivatsiya_command(message: types.Message):
 
-    quote = random.choice(MOTIVATSIYA_QUOTES)
-
     await message.answer(
-        "🔥 <b>MOTIVATSIYA</b>\n\n"
-        f"💬 <i>\"{html.escape(quote['quote'])}\"</i>\n\n"
-        f"— <b>{html.escape(quote['muallif'])}</b>\n\n"
-        "━━━━━━━━━━━━━━\n\n"
-        f"🇺🇿 {html.escape(quote['tarjima'])}",
+        build_motivatsiya_text(),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔥 Yana motivatsiya!", callback_data="menu_motivatsiya")],
             [InlineKeyboardButton(text="⬅️ Menyu", callback_data="back_main")],
@@ -2017,69 +1963,52 @@ async def motivatsiya_command(message: types.Message):
 
 @dp.message(Command("matematik"))
 async def matematik_command(message: types.Message):
-    data = generate_math_problem_with_options()
-    user_math_sessions[message.from_user.id] = data
 
-    await message.answer(
-        "🧮 <b>MATEMATIK MASALA</b>\n\n"
-        f"❓ <code>{data['problem']}</code>\n\n"
-        f"A) {data['options'][0]}\n"
-        f"B) {data['options'][1]}\n"
-        f"C) {data['options'][2]}\n\n"
-        "👇 <i>To'g'ri javobni tanlang:</i>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text=f"A) {data['options'][0]}", callback_data=f"math_choice_0_{data['correct_idx']}"),
-                InlineKeyboardButton(text=f"B) {data['options'][1]}", callback_data=f"math_choice_1_{data['correct_idx']}"),
-            ],
-            [
-                InlineKeyboardButton(text=f"C) {data['options'][2]}", callback_data=f"math_choice_2_{data['correct_idx']}"),
-            ],
-            [
-                InlineKeyboardButton(text="🧮 Yangi masala", callback_data="menu_matematik"),
-                InlineKeyboardButton(text="⬅️ Menyu", callback_data="back_main"),
-            ],
-        ])
-    )
+    text, keyboard = build_math_message(message.from_user.id)
+    await message.answer(text, reply_markup=keyboard)
 
 
 # ============================================================
 # /obhavo
 # ============================================================
 
+WEATHER_INTRO_TEXT = (
+    "🌤 <b>OB-HAVO MA'LUMOTLARI</b>\n\n"
+    "Quyidagi shaharlardan birini tanlang — harorat, namlik, shamol va "
+    "bosim haqidagi joriy ma'lumotni yuboraman.\n\n"
+    "📌 Batafsil prognoz uchun: 👉 @Obb_hovo_Bot"
+)
+
+
 @dp.message(Command("obhavo"))
 async def obhavo_command(message: types.Message):
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🌤 @Obb_hovo_Bot ga o'tish", url="https://t.me/Obb_hovo_Bot")
-        ]
-    ])
     await message.answer(
-        "🌤 <b>OB-HAVO MA'LUMOTLARI</b>\n\n"
-        "O'zbekiston viloyatlari va dunyo shaharlari bo'yicha aniq ob-havoni bilish uchun rasmiy botimizga o'ting:\n\n"
-        "👉 @Obb_hovo_Bot",
-        reply_markup=markup
+        WEATHER_INTRO_TEXT,
+        reply_markup=get_weather_inline_keyboard()
     )
 
 
 async def send_weather(message_or_callback, city: str):
-    """Ob-havo ma'lumotini yuboradi."""
+    """Ob-havo ma'lumotini yuboradi (wttr.in xizmati orqali)."""
+    target = (
+        message_or_callback.message
+        if isinstance(message_or_callback, CallbackQuery)
+        else message_or_callback
+    )
+
     try:
         response = await asyncio.to_thread(
             requests.get,
-            f"https://wttr.in/{city}?format=j1",
+            f"https://wttr.in/{requests.utils.quote(city)}?format=j1",
             timeout=10
         )
 
         if response.status_code != 200:
-            text = (
-                f"⚠️ <b>{html.escape(city)}</b> shahari topilmadi.\n"
-                "Qaytadan urinib ko'ring."
+            await target.answer(
+                f"⚠️ <b>{html.escape(city)}</b> shahri topilmadi.\n"
+                "Boshqa shaharni tanlab ko'ring.",
+                reply_markup=get_weather_inline_keyboard()
             )
-            if isinstance(message_or_callback, CallbackQuery):
-                await message_or_callback.message.answer(text)
-            else:
-                await message_or_callback.answer(text)
             return
 
         data = response.json()
@@ -2113,7 +2042,7 @@ async def send_weather(message_or_callback, city: str):
                 temp_emoji = "❄️"
             else:
                 temp_emoji = "🥶"
-        except ValueError:
+        except (TypeError, ValueError):
             temp_emoji = "🌡"
 
         weather_text = (
@@ -2130,18 +2059,18 @@ async def send_weather(message_or_callback, city: str):
             f"☀️ UV indeks: <b>{uv_index}</b>"
         )
 
-        if isinstance(message_or_callback, CallbackQuery):
-            await message_or_callback.message.answer(weather_text)
-        else:
-            await message_or_callback.answer(weather_text)
+        await target.answer(
+            weather_text,
+            reply_markup=get_weather_inline_keyboard()
+        )
 
     except Exception as e:
         logger.error("Ob-havo xatosi: %s", e)
-        error_text = "⚠️ Ob-havo ma'lumotini olishda xatolik yuz berdi."
-        if isinstance(message_or_callback, CallbackQuery):
-            await message_or_callback.message.answer(error_text)
-        else:
-            await message_or_callback.answer(error_text)
+        await target.answer(
+            "⚠️ Ob-havo ma'lumotini olishda xatolik yuz berdi.\n"
+            "Biroz kutib, qaytadan urinib ko'ring.",
+            reply_markup=get_weather_inline_keyboard()
+        )
 
 
 # ============================================================
@@ -2150,13 +2079,10 @@ async def send_weather(message_or_callback, city: str):
 
 @dp.callback_query(F.data == "back_main")
 async def callback_back_main(callback: CallbackQuery):
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-    await callback.message.answer(
-        "📋 <b>ASOSIY MENYU</b>\n\nKerakli bo'limni quyidagi tugmalardan tanlang:",
-        reply_markup=get_main_menu_keyboard()
+    await safe_edit_text(
+        callback,
+        "📋 <b>ASOSIY MENYU</b>\n\nKerakli bo'limni tanlang:",
+        reply_markup=get_main_menu_inline_keyboard()
     )
     await callback.answer()
 
@@ -2167,18 +2093,11 @@ async def callback_back_main(callback: CallbackQuery):
 async def callback_menu_lang(callback: CallbackQuery):
 
     current = get_user_lang(callback.from_user.id)
-    lang_names = {
-        "auto": "🔄 Avtomatik",
-        "uz": "🇺🇿 O'zbekcha",
-        "en": "🇬🇧 English",
-        "ru": "🇷🇺 Русский",
-        "ko": "🇰🇷 한국어 (Koreys)",
-        "tr": "🇹🇷 Türkçe (Turk)",
-    }
 
-    await callback.message.edit_text(
+    await safe_edit_text(
+        callback,
         "🌐 <b>TIL SOZLAMALARI</b>\n\n"
-        f"Hozirgi til: <b>{lang_names.get(current, 'Avtomatik')}</b>\n\n"
+        f"Hozirgi til: <b>{lang_title(current)}</b>\n\n"
         "Tarjima maqsad tilini tanlang:",
         reply_markup=get_lang_inline_keyboard()
     )
@@ -2189,27 +2108,24 @@ async def callback_menu_lang(callback: CallbackQuery):
 async def callback_lang_select(callback: CallbackQuery):
 
     lang = callback.data.replace("lang_", "")
+
+    if lang not in LANG_NAMES:
+        await callback.answer("Noma'lum til.", show_alert=True)
+        return
+
     set_user_lang(callback.from_user.id, lang)
 
-    lang_names = {
-        "auto": "🔄 Avtomatik",
-        "uz": "🇺🇿 O'zbekcha",
-        "en": "🇬🇧 English",
-        "ru": "🇷🇺 Русский",
-        "ko": "🇰🇷 한국어 (Koreys)",
-        "tr": "🇹🇷 Türkçe (Turk)",
-    }
-
-    await callback.message.edit_text(
+    await safe_edit_text(
+        callback,
         "✅ <b>Tarjima tili o'zgartirildi!</b>\n\n"
-        f"Yangi maqsad til: <b>{lang_names.get(lang, lang)}</b>\n\n"
+        f"Yangi maqsad til: <b>{lang_title(lang)}</b>\n\n"
         "Endi yuborganingiz shu tilga tarjima qilinadi.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Boshqa tilni tanlash", callback_data="menu_lang")],
             [InlineKeyboardButton(text="🏠 Asosiy menyu", callback_data="back_main")],
         ])
     )
-    await callback.answer(f"Til: {lang_names.get(lang, lang)}")
+    await callback.answer(f"Til: {lang_title(lang)}")
 
 
 
@@ -2228,10 +2144,43 @@ def get_kutubxona_inline_keyboard():
 
 # --- Kutubxona callbacks ---
 
+def build_books_text(category: str) -> str:
+    """Kategoriyadagi kitoblar ro'yxatini HTML matn sifatida tayyorlaydi."""
+    books = KUTUBXONA.get(category, [])
+    text = f"📚 <b>{html.escape(category)}</b>\n\n"
+
+    for i, book in enumerate(books, 1):
+        text += (
+            f"<b>{i}. {html.escape(book['nom'])}</b>\n"
+            f"✍️ {html.escape(book['muallif'])}\n"
+            f"📝 <i>{html.escape(book['tavsif'])}</i>\n\n"
+        )
+
+    return text
+
+
+def build_fakt_text() -> str:
+    """Tasodifiy qiziqarli fakt matni."""
+    return f"💡 <b>QIZIQARLI FAKT</b>\n\n{random.choice(FAKTLAR)}"
+
+
+def build_motivatsiya_text() -> str:
+    """Tasodifiy motivatsion iqtibos matni."""
+    quote = random.choice(MOTIVATSIYA_QUOTES)
+    return (
+        "🔥 <b>MOTIVATSIYA</b>\n\n"
+        f"💬 <i>\"{html.escape(quote['quote'])}\"</i>\n\n"
+        f"— <b>{html.escape(quote['muallif'])}</b>\n\n"
+        "━━━━━━━━━━━━━━\n\n"
+        f"🇺🇿 {html.escape(quote['tarjima'])}"
+    )
+
+
 @dp.callback_query(F.data == "menu_kutubxona")
 async def callback_menu_kutubxona(callback: CallbackQuery):
 
-    await callback.message.edit_text(
+    await safe_edit_text(
+        callback,
         "📚 <b>KUTUBXONA</b>\n\n"
         "Kategoriyani tanlang:",
         reply_markup=get_kutubxona_inline_keyboard()
@@ -2243,23 +2192,14 @@ async def callback_menu_kutubxona(callback: CallbackQuery):
 async def callback_lib_category(callback: CallbackQuery):
 
     category = callback.data.replace("lib_", "")
-    books = KUTUBXONA.get(category, [])
 
-    if not books:
-        await callback.answer("Kitoblar topilmadi.")
+    if category not in KUTUBXONA:
+        await callback.answer("Kitoblar topilmadi.", show_alert=True)
         return
 
-    text = f"📚 <b>{html.escape(category)}</b>\n\n"
-
-    for i, book in enumerate(books, 1):
-        text += (
-            f"<b>{i}. {html.escape(book['nom'])}</b>\n"
-            f"✍️ {html.escape(book['muallif'])}\n"
-            f"📝 <i>{html.escape(book['tavsif'])}</i>\n\n"
-        )
-
-    await callback.message.edit_text(
-        text,
+    await safe_edit_text(
+        callback,
+        build_books_text(category),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Kategoriyalar", callback_data="menu_kutubxona")],
             [InlineKeyboardButton(text="🏠 Menyu", callback_data="back_main")],
@@ -2273,11 +2213,9 @@ async def callback_lib_category(callback: CallbackQuery):
 @dp.callback_query(F.data == "menu_fakt")
 async def callback_menu_fakt(callback: CallbackQuery):
 
-    fakt = random.choice(FAKTLAR)
-
-    await callback.message.edit_text(
-        "💡 <b>QIZIQARLI FAKT</b>\n\n"
-        f"{fakt}",
+    await safe_edit_text(
+        callback,
+        build_fakt_text(),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💡 Yana fakt!", callback_data="menu_fakt")],
             [InlineKeyboardButton(text="⬅️ Menyu", callback_data="back_main")],
@@ -2291,14 +2229,9 @@ async def callback_menu_fakt(callback: CallbackQuery):
 @dp.callback_query(F.data == "menu_motivatsiya")
 async def callback_menu_motivatsiya(callback: CallbackQuery):
 
-    quote = random.choice(MOTIVATSIYA_QUOTES)
-
-    await callback.message.edit_text(
-        "🔥 <b>MOTIVATSIYA</b>\n\n"
-        f"💬 <i>\"{html.escape(quote['quote'])}\"</i>\n\n"
-        f"— <b>{html.escape(quote['muallif'])}</b>\n\n"
-        "━━━━━━━━━━━━━━\n\n"
-        f"🇺🇿 {html.escape(quote['tarjima'])}",
+    await safe_edit_text(
+        callback,
+        build_motivatsiya_text(),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔥 Yana!", callback_data="menu_motivatsiya")],
             [InlineKeyboardButton(text="⬅️ Menyu", callback_data="back_main")],
@@ -2307,66 +2240,106 @@ async def callback_menu_motivatsiya(callback: CallbackQuery):
     await callback.answer()
 
 
-# --- Matematik callbacks (A, B, C Variantlari) ---
+# --- Matematik (A, B, C Variantlari) ---
+
+MATH_LETTERS = ["A", "B", "C", "D"]
+
+
+def build_math_message(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """
+    Yangi matematik masala yaratadi va uni sessiyaga yozadi.
+
+    To'g'ri javob indeksi callback_data ichida emas, sessiyada saqlanadi —
+    aks holda foydalanuvchi tugma ma'lumotidan javobni bilib olishi mumkin.
+    """
+    data = generate_math_problem_with_options()
+    user_math_sessions[user_id] = data
+
+    options = data["options"]
+
+    text = "🧮 <b>MATEMATIK MASALA</b>\n\n" + f"❓ <code>{html.escape(data['problem'])}</code>\n\n"
+    for i, option in enumerate(options):
+        text += f"{MATH_LETTERS[i]}) {html.escape(option)}\n"
+    text += "\n👇 <i>To'g'ri javobni tanlang:</i>"
+
+    answer_row = [
+        InlineKeyboardButton(
+            text=f"{MATH_LETTERS[i]}) {option}",
+            callback_data=f"math_choice_{i}",
+        )
+        for i, option in enumerate(options)
+    ]
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        answer_row,
+        [
+            InlineKeyboardButton(text="🧮 Yangi masala", callback_data="menu_matematik"),
+            InlineKeyboardButton(text="⬅️ Menyu", callback_data="back_main"),
+        ],
+    ])
+
+    return text, keyboard
+
 
 @dp.callback_query(F.data == "menu_matematik")
 async def callback_menu_matematik(callback: CallbackQuery):
 
-    data = generate_math_problem_with_options()
-    user_math_sessions[callback.from_user.id] = data
-
-    await callback.message.edit_text(
-        "🧮 <b>MATEMATIK MASALA</b>\n\n"
-        f"❓ <code>{data['problem']}</code>\n\n"
-        f"A) {data['options'][0]}\n"
-        f"B) {data['options'][1]}\n"
-        f"C) {data['options'][2]}\n\n"
-        "👇 <i>To'g'ri javobni tanlang:</i>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text=f"A) {data['options'][0]}", callback_data=f"math_choice_0_{data['correct_idx']}"),
-                InlineKeyboardButton(text=f"B) {data['options'][1]}", callback_data=f"math_choice_1_{data['correct_idx']}"),
-            ],
-            [
-                InlineKeyboardButton(text=f"C) {data['options'][2]}", callback_data=f"math_choice_2_{data['correct_idx']}"),
-            ],
-            [
-                InlineKeyboardButton(text="🧮 Yangi masala", callback_data="menu_matematik"),
-                InlineKeyboardButton(text="⬅️ Menyu", callback_data="back_main"),
-            ],
-        ])
-    )
+    text, keyboard = build_math_message(callback.from_user.id)
+    await safe_edit_text(callback, text, reply_markup=keyboard)
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("math_choice_"))
 async def callback_math_choice(callback: CallbackQuery):
-    parts = callback.data.replace("math_choice_", "").split("_")
-    choice_idx = int(parts[0])
-    correct_idx = int(parts[1])
+
     session = user_math_sessions.get(callback.from_user.id)
-    letters = ["A", "B", "C"]
-    chosen_letter = letters[choice_idx] if choice_idx < len(letters) else "?"
-    correct_letter = letters[correct_idx] if correct_idx < len(letters) else "?"
+
+    if not session:
+        await callback.answer(
+            "Bu masala eskirgan. Yangi masala oling.",
+            show_alert=True
+        )
+        return
+
+    try:
+        choice_idx = int(callback.data.replace("math_choice_", ""))
+    except ValueError:
+        await callback.answer()
+        return
+
+    correct_idx = session["correct_idx"]
+    options = session["options"]
+
+    if not 0 <= choice_idx < len(options):
+        await callback.answer()
+        return
+
+    chosen_letter = MATH_LETTERS[choice_idx]
+    correct_letter = MATH_LETTERS[correct_idx]
 
     if choice_idx == correct_idx:
         await callback.answer("✅ To'g'ri javob! Barakalla! 🎉", show_alert=True)
         msg_text = (
             "🎉 <b>A'LO! TO'G'RI JAVOB!</b>\n\n"
-            f"Siz tanlagan javob: <b>{chosen_letter}</b> ✅\n\n"
+            f"❓ <code>{html.escape(session['problem'])}</code>\n"
+            f"Siz tanlagan javob: <b>{chosen_letter}) {html.escape(options[choice_idx])}</b> ✅\n\n"
             "Yana masala yechish uchun quyidagi tugmani bosing:"
         )
     else:
-        correct_ans = session["options"][correct_idx] if session else ""
         await callback.answer("❌ Noto'g'ri javob!", show_alert=True)
         msg_text = (
             "❌ <b>NOTO'G'RI JAVOB!</b>\n\n"
-            f"Siz tanlagan javob: <b>{chosen_letter}</b>\n"
-            f"To'g'ri javob: <b>{correct_letter}) {correct_ans}</b>\n\n"
+            f"❓ <code>{html.escape(session['problem'])}</code>\n"
+            f"Siz tanlagan javob: <b>{chosen_letter}) {html.escape(options[choice_idx])}</b>\n"
+            f"To'g'ri javob: <b>{correct_letter}) {html.escape(options[correct_idx])}</b>\n\n"
             "Keyingi masalada omad tilaymiz!"
         )
 
-    await callback.message.edit_text(
+    # Masala yakunlandi — sessiyani tozalaymiz
+    user_math_sessions.pop(callback.from_user.id, None)
+
+    await safe_edit_text(
+        callback,
         msg_text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🧮 Yana masala", callback_data="menu_matematik")],
@@ -2375,23 +2348,15 @@ async def callback_math_choice(callback: CallbackQuery):
     )
 
 
-# --- Ob-havo callback (12 ta viloyat) ---
+# --- Ob-havo callbacklari ---
 
 @dp.callback_query(F.data == "menu_obhavo")
 async def callback_menu_obhavo(callback: CallbackQuery):
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🌤 @Obb_hovo_Bot ga o'tish", url="https://t.me/Obb_hovo_Bot")
-        ],
-        [
-            InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="back_main")
-        ]
-    ])
-    await callback.message.edit_text(
-        "🌤 <b>OB-HAVO MA'LUMOTLARI</b>\n\n"
-        "O'zbekistonning barcha 12 ta viloyati va dunyo shaharlari ob-havosini bilish uchun maxsus botimizga o'ting:\n\n"
-        "👉 @Obb_hovo_Bot",
-        reply_markup=markup
+
+    await safe_edit_text(
+        callback,
+        WEATHER_INTRO_TEXT,
+        reply_markup=get_weather_inline_keyboard()
     )
     await callback.answer()
 
@@ -2400,6 +2365,11 @@ async def callback_menu_obhavo(callback: CallbackQuery):
 async def callback_weather(callback: CallbackQuery):
 
     city = callback.data.replace("weather_", "").replace("+", " ")
+
+    if city not in WEATHER_CITY_MAP.values():
+        await callback.answer("Noma'lum shahar.", show_alert=True)
+        return
+
     await callback.answer(f"🌤 {city}...")
     await send_weather(callback, city)
 
@@ -2409,22 +2379,9 @@ async def callback_weather(callback: CallbackQuery):
 @dp.callback_query(F.data == "menu_stats")
 async def callback_menu_stats(callback: CallbackQuery):
 
-    searches, history_count = get_user_stats(callback.from_user.id)
-    current = get_user_lang(callback.from_user.id)
-    lang_names = {
-        "auto": "🔄 Avtomatik",
-        "uz": "🇺🇿 O'zbekcha",
-        "en": "🇬🇧 English",
-        "ru": "🇷🇺 Русский",
-        "ko": "🇰🇷 한국어 (Koreys)",
-        "tr": "🇹🇷 Türkçe (Turk)",
-    }
-
-    await callback.message.edit_text(
-        "📊 <b>SIZNING STATISTIKANGIZ</b>\n\n"
-        f"🔎 Qidiruvlar: <b>{searches}</b>\n"
-        f"🕘 Tarixdagi yozuvlar: <b>{history_count}</b>\n"
-        f"🌐 Tarjima tili: <b>{lang_names.get(current, 'Avtomatik')}</b>",
+    await safe_edit_text(
+        callback,
+        build_stats_text(callback.from_user.id),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Menyu", callback_data="back_main")],
         ])
@@ -2438,31 +2395,17 @@ async def callback_menu_stats(callback: CallbackQuery):
 async def callback_menu_history(callback: CallbackQuery):
 
     rows = get_history(callback.from_user.id)
+    text = build_history_text(callback.from_user.id)
 
-    if not rows:
-        await callback.message.edit_text(
-            "🕘 Hozircha qidiruv tarixingiz bo'sh.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ Menyu", callback_data="back_main")],
-            ])
-        )
-        await callback.answer()
-        return
+    buttons = []
+    if rows:
+        buttons.append([InlineKeyboardButton(text="🗑 Tozalash", callback_data="menu_clear")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Menyu", callback_data="back_main")])
 
-    text = "🕘 <b>OXIRGI QIDIRUVLAR</b>\n\n"
-    for index, (query, result) in enumerate(rows, start=1):
-        text += (
-            f"<b>{index}.</b> "
-            f"{html.escape(query)}\n"
-            f"→ {html.escape(result[:100])}\n\n"
-        )
-
-    await callback.message.edit_text(
+    await safe_edit_text(
+        callback,
         text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🗑 Tozalash", callback_data="menu_clear")],
-            [InlineKeyboardButton(text="⬅️ Menyu", callback_data="back_main")],
-        ])
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
     await callback.answer()
 
@@ -2470,10 +2413,11 @@ async def callback_menu_history(callback: CallbackQuery):
 @dp.callback_query(F.data == "menu_clear")
 async def callback_menu_clear(callback: CallbackQuery):
 
-    clear_history(callback.from_user.id)
+    removed = clear_history(callback.from_user.id)
 
-    await callback.message.edit_text(
-        "🗑 <b>Tarix tozalandi.</b>",
+    await safe_edit_text(
+        callback,
+        f"🗑 <b>Tarix tozalandi.</b>\n\n{removed} ta yozuv o'chirildi.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Menyu", callback_data="back_main")],
         ])
@@ -2486,18 +2430,9 @@ async def callback_menu_clear(callback: CallbackQuery):
 @dp.callback_query(F.data == "menu_help")
 async def callback_menu_help(callback: CallbackQuery):
 
-    await callback.message.edit_text(
-        "📚 <b>BOTDAN FOYDALANISH</b>\n\n"
-
-        "1️⃣ <b>Tarjima</b> — So'z yoki gap yuboring (UZ/EN/RU/KO/TR)\n"
-        "2️⃣ <b>/lang</b> — Maqsad tilini tanlang\n"
-        "3️⃣ <b>/test</b> — Til testlari (20/40/60/80/100 savol)\n"
-        "4️⃣ <b>/matematik</b> — A, B, C variantli masala\n"
-        "5️⃣ <b>/obhavo</b> — 12 ta viloyat ob-havosi\n"
-        "6️⃣ <b>/kutubxona</b> — Kitoblar\n"
-        "8️⃣ <b>/fakt</b> — Qiziqarli fakt\n"
-        "9️⃣ <b>/motivatsiya</b> — Ruhlantiruvchi so'zlar\n"
-        "🔟 <b>/stats</b> — Qidiruvlar statistikasi\n",
+    await safe_edit_text(
+        callback,
+        HELP_TEXT,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Menyu", callback_data="back_main")],
         ])
@@ -2509,28 +2444,33 @@ async def callback_menu_help(callback: CallbackQuery):
 # /quiz — SAVOLLAR
 # ============================================================
 
+QUIZ_INTRO_TEXT = (
+    "🎲 <b>QUIZ — TIL VA BILIM VIKTORINASI</b>\n\n"
+    f"Jami {len(QUIZ_QUESTIONS)} ta savol: 🇬🇧 English, 🇺🇿 O'zbekcha, 🇷🇺 Русский\n\n"
+    "Kategoriyani tanlang:"
+)
+
+
 @dp.message(Command("quiz"))
 async def quiz_command(message: types.Message):
 
     await message.answer(
-        "📝 <b>QUIZ — TIL O'RGANISH SAVOLLARI</b>\n\n"
-        "20 ta savol: 🇬🇧 English, 🇺🇿 O'zbekcha, 🇷🇺 Русский\n\n"
-        "Kategoriyani tanlang:",
+        QUIZ_INTRO_TEXT,
         reply_markup=get_quiz_keyboard()
     )
 
 
 @dp.message(Command("savol"))
 async def savol_command(message: types.Message):
-    """Alias for /quiz."""
+    """/quiz buyrug'ining muqobil nomi."""
     await quiz_command(message)
 
 
 def build_quiz_message(q_index: int):
-    """Quiz savoli uchun matn va keyboard yaratadi."""
+    """Quiz savoli uchun matn va inline keyboard yaratadi."""
     q = QUIZ_QUESTIONS[q_index]
     text = (
-        f"📝 <b>SAVOL {q_index + 1}/20</b>\n\n"
+        f"📝 <b>SAVOL {q_index + 1}/{len(QUIZ_QUESTIONS)}</b>\n\n"
         f"{q['savol']}\n\n"
     )
     for i, variant in enumerate(q['variantlar']):
@@ -2551,7 +2491,7 @@ def build_quiz_message(q_index: int):
     if row:
         buttons.append(row)
 
-    # Navigation
+    # Navigatsiya
     nav_row = []
     if q_index > 0:
         nav_row.append(InlineKeyboardButton(text="⬅️ Oldingi", callback_data=f"quizn_{q_index - 1}"))
@@ -2560,8 +2500,11 @@ def build_quiz_message(q_index: int):
     if nav_row:
         buttons.append(nav_row)
 
-    buttons.append([InlineKeyboardButton(text="📝 Quiz menyu", callback_data="menu_quiz")])
-    buttons.append([InlineKeyboardButton(text="🏠 Menyu", callback_data="back_main")])
+    buttons.append([InlineKeyboardButton(text="🎲 Tasodifiy", callback_data="quiz_random")])
+    buttons.append([
+        InlineKeyboardButton(text="📝 Quiz menyu", callback_data="menu_quiz"),
+        InlineKeyboardButton(text="🏠 Menyu", callback_data="back_main"),
+    ])
 
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -2571,11 +2514,12 @@ def build_quiz_message(q_index: int):
 @dp.callback_query(F.data == "menu_quiz")
 async def callback_menu_quiz(callback: CallbackQuery):
 
-    await callback.message.edit_text(
-        "📝 <b>QUIZ — TIL O'RGANISH SAVOLLARI</b>\n\n"
-        "20 ta savol: 🇬🇧 English, 🇺🇿 O'zbekcha, 🇷🇺 Русский\n\n"
-        "Kategoriyani tanlang:",
-        reply_markup=get_quiz_keyboard()
+    # Diqqat: edit_text faqat InlineKeyboardMarkup qabul qiladi,
+    # shuning uchun bu yerda Reply emas, Inline klaviatura ishlatiladi.
+    await safe_edit_text(
+        callback,
+        QUIZ_INTRO_TEXT,
+        reply_markup=get_quiz_inline_keyboard()
     )
     await callback.answer()
 
@@ -2583,38 +2527,47 @@ async def callback_menu_quiz(callback: CallbackQuery):
 @dp.callback_query(F.data == "quiz_random")
 async def callback_quiz_random(callback: CallbackQuery):
 
-    q_index = random.randint(0, len(QUIZ_QUESTIONS) - 1)
+    q_index = random.randrange(len(QUIZ_QUESTIONS))
     text, keyboard = build_quiz_message(q_index)
-    await callback.message.edit_text(text, reply_markup=keyboard)
+    await safe_edit_text(callback, text, reply_markup=keyboard)
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("quiz_cat_"))
 async def callback_quiz_category(callback: CallbackQuery):
-
+    """Tanlangan kategoriyadan tasodifiy savol beradi."""
     cat = callback.data.replace("quiz_cat_", "")
-    ranges = {
-        "words": (0, 12),
-        "grammar": (12, 24),
-        "vocab": (24, 36),
-        "logic": (36, 48),
-        "world": (48, 60),
-        "mixed": (0, 60),
-    }
-    start, end = ranges.get(cat, (0, 5))
-    q_index = start  # Birinchi savoldan boshlaymiz
+    category = QUIZ_CATEGORIES.get(cat)
+
+    if not category:
+        await callback.answer("Bunday kategoriya yo'q.", show_alert=True)
+        return
+
+    _, start, end = category
+    end = min(end, len(QUIZ_QUESTIONS))
+
+    if start >= end:
+        await callback.answer("Bu kategoriyada savol yo'q.", show_alert=True)
+        return
+
+    q_index = random.randrange(start, end)
     text, keyboard = build_quiz_message(q_index)
-    await callback.message.edit_text(text, reply_markup=keyboard)
+    await safe_edit_text(callback, text, reply_markup=keyboard)
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("quizn_"))
 async def callback_quiz_navigate(callback: CallbackQuery):
     """Quiz savollar orasida navigatsiya."""
-    q_index = int(callback.data.replace("quizn_", ""))
+    try:
+        q_index = int(callback.data.replace("quizn_", ""))
+    except ValueError:
+        await callback.answer()
+        return
+
     if 0 <= q_index < len(QUIZ_QUESTIONS):
         text, keyboard = build_quiz_message(q_index)
-        await callback.message.edit_text(text, reply_markup=keyboard)
+        await safe_edit_text(callback, text, reply_markup=keyboard)
     await callback.answer()
 
 
@@ -2622,11 +2575,24 @@ async def callback_quiz_navigate(callback: CallbackQuery):
 async def callback_quiz_answer(callback: CallbackQuery):
     """Quiz javobini tekshirish."""
     parts = callback.data.replace("quiza_", "").split("_")
-    q_index = int(parts[0])
-    selected = int(parts[1])
+
+    try:
+        q_index = int(parts[0])
+        selected = int(parts[1])
+    except (IndexError, ValueError):
+        await callback.answer()
+        return
+
+    if not 0 <= q_index < len(QUIZ_QUESTIONS):
+        await callback.answer("Savol topilmadi.", show_alert=True)
+        return
 
     q = QUIZ_QUESTIONS[q_index]
     correct = q['javob']
+
+    if not 0 <= selected < len(q['variantlar']):
+        await callback.answer()
+        return
 
     if selected == correct:
         result_emoji = "✅"
@@ -2636,7 +2602,7 @@ async def callback_quiz_answer(callback: CallbackQuery):
         result_text = f"NOTO'G'RI! To'g'ri javob: <b>{chr(65 + correct)}) {q['variantlar'][correct]}</b>"
 
     text = (
-        f"📝 <b>SAVOL {q_index + 1}/20</b>\n\n"
+        f"📝 <b>SAVOL {q_index + 1}/{len(QUIZ_QUESTIONS)}</b>\n\n"
         f"{q['savol']}\n\n"
     )
     for i, variant in enumerate(q['variantlar']):
@@ -2665,7 +2631,8 @@ async def callback_quiz_answer(callback: CallbackQuery):
         InlineKeyboardButton(text="🏠 Menyu", callback_data="back_main"),
     ])
 
-    await callback.message.edit_text(
+    await safe_edit_text(
+        callback,
         text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=nav_buttons)
     )
@@ -2736,12 +2703,11 @@ async def extract_text_from_image_bytes(image_bytes: bytes) -> str:
             logger.warning("RapidOCR xatosi: %s", e)
 
     # 2. OCR.space Online Cloud API fallback (API key kerak)
-    ocr_space_api_key = os.getenv("OCR_SPACE_API_KEY")
-    if ocr_space_api_key:
+    if OCR_SPACE_API_KEY:
         try:
             def _run_ocr_space():
                 payload = {
-                    "apikey": ocr_space_api_key,
+                    "apikey": OCR_SPACE_API_KEY,
                     "OCREngine": "2",
                 }
                 r = requests.post(
@@ -2798,23 +2764,18 @@ async def process_image_translation(
     if caption_text:
         try:
             detected = await translator_detect(caption_text)
-            lang = detected.lang
-            user_pref = get_user_lang(message.from_user.id)
-            if user_pref != "auto":
-                destination = user_pref
-                if lang == destination:
-                    destination = "uz" if lang != "uz" else "en"
-            else:
-                destination = "en" if lang == "uz" else "uz"
+            lang = getattr(detected, "lang", "en") or "en"
+            destination = choose_destination(lang, get_user_lang(message.from_user.id))
 
             result = await translator_translate(caption_text, destination)
             src_flag = GLOBAL_LANG_FLAGS.get(lang, "🌐")
             dst_flag = GLOBAL_LANG_FLAGS.get(destination, "🌐")
 
             increment_search(message.from_user.id)
-            save_history(message.from_user.id, caption_text[:100], result.text[:100])
+            save_history(message.from_user.id, caption_text, result.text)
 
-            await message.answer(
+            await answer_long(
+                message,
                 f"📷 <b>RASM CAPTION TARJIMASI</b> {src_flag} → {dst_flag}\n\n"
                 f"📝 <b>Original izoh:</b>\n{html.escape(caption_text)}\n\n"
                 "━━━━━━━━━━━━━━\n\n"
@@ -2826,6 +2787,17 @@ async def process_image_translation(
             logger.error("Caption tarjima xatosi: %s", e)
 
     # 2. Rasmdan matn o'qish (OCR)
+    if not OCR_AVAILABLE:
+        await message.answer(
+            "📷 <b>Rasmdan matn o'qish hozircha ishlamayapti.</b>\n\n"
+            "Serverda OCR kutubxonasi o'rnatilmagan "
+            "(<code>rapidocr-onnxruntime</code> yoki <code>pytesseract</code>), "
+            "OCR_SPACE_API_KEY ham berilmagan.\n\n"
+            "💡 Hozircha rasmga izoh (caption) yozib yuboring — izohni tarjima qilib beraman.",
+            reply_markup=get_main_menu_keyboard()
+        )
+        return
+
     wait_msg = await message.answer("⏳ <b>Rasm tahlil qilinmoqda...</b> Matn o'qilmoqda...")
 
     try:
@@ -2845,13 +2817,7 @@ async def process_image_translation(
         src_lang = getattr(detected, "lang", "en") or "en"
 
         # Maqsad tili
-        user_pref = get_user_lang(message.from_user.id)
-        if user_pref != "auto":
-            dest_lang = user_pref
-            if src_lang == dest_lang:
-                dest_lang = "uz" if src_lang != "uz" else "en"
-        else:
-            dest_lang = "en" if src_lang == "uz" else "uz"
+        dest_lang = choose_destination(src_lang, get_user_lang(message.from_user.id))
 
         # Google Translate orqali tarjima qilish
         result = await translator_translate(extracted_text, dest_lang)
@@ -2863,12 +2829,12 @@ async def process_image_translation(
         dst_name = GLOBAL_LANG_NAMES.get(dest_lang, dest_lang.upper())
 
         increment_search(message.from_user.id)
-        save_history(message.from_user.id, extracted_text[:100], translated_text[:100])
+        save_history(message.from_user.id, extracted_text, translated_text)
 
-        # Keshga saqlash
+        # Keshga saqlash (eng eski yozuv o'chiriladi)
         cache_id = wait_msg.message_id
         photo_text_cache[cache_id] = extracted_text
-        if len(photo_text_cache) > 500:
+        while len(photo_text_cache) > PHOTO_CACHE_LIMIT:
             photo_text_cache.pop(next(iter(photo_text_cache)))
 
         response_text = (
@@ -2897,14 +2863,21 @@ async def process_image_translation(
 @dp.callback_query(F.data == "menu_photo")
 async def callback_menu_photo(callback: CallbackQuery):
 
-    await callback.message.edit_text(
+    ocr_status = (
+        "✅ <b>OCR tizimi faol!</b>"
+        if OCR_AVAILABLE
+        else "⚠️ <b>OCR hozircha o'chiq</b> — rasmga izoh (caption) yozib yuboring."
+    )
+
+    await safe_edit_text(
+        callback,
         "📷 <b>RASM TARJIMA XIZMATI</b>\n\n"
         "Rasmda matn bormi? Menga yuboring!\n\n"
         "📌 <b>Qanday ishlaydi:</b>\n"
         "1. Matni bor istalgan rasmni yuboring\n"
         "2. Bot rasmdagi matnni sun'iy intellekt (OCR) orqali o'qiydi\n"
         "3. Matnni Google Translate orqali avtomatik tarjima qilib beradi!\n\n"
-        "✅ <b>OCR tizimi to'liq faol!</b>\n\n"
+        f"{ocr_status}\n\n"
         "💡 <i>Istalgan tildagi (Ingliz, Rus, Turk, Koreys va h.k.) rasmlarni yuborishingiz mumkin.</i>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Menyu", callback_data="back_main")],
@@ -2922,7 +2895,12 @@ async def callback_photo_retranslate(callback: CallbackQuery):
         return
 
     dest_lang = parts[1]
-    msg_id = int(parts[2])
+
+    try:
+        msg_id = int(parts[2])
+    except ValueError:
+        await callback.answer()
+        return
 
     extracted_text = photo_text_cache.get(msg_id)
     if not extracted_text:
@@ -2951,7 +2929,8 @@ async def callback_photo_retranslate(callback: CallbackQuery):
             f"🔄 <b>Google Tarjimasi ({dst_name}):</b>\n{html.escape(translated_text[:1500])}"
         )
 
-        await callback.message.edit_text(
+        await safe_edit_text(
+            callback,
             response_text,
             reply_markup=get_photo_translate_keyboard(msg_id, dest_lang)
         )
@@ -2964,25 +2943,60 @@ async def callback_photo_retranslate(callback: CallbackQuery):
 # PHOTO HANDLER — RASM TARJIMA
 # ============================================================
 
+async def download_telegram_file(file_id: str) -> bytes | None:
+    """Telegram serveridan faylni yuklab oladi (xatolikda None qaytaradi)."""
+    try:
+        file_info = await bot.get_file(file_id)
+        file_bytes_io = await bot.download_file(file_info.file_path)
+        return file_bytes_io.getvalue()
+    except Exception as error:
+        logger.error("Faylni yuklab bo'lmadi: %s", error)
+        return None
+
+
 @dp.message(F.photo)
 async def photo_handler(message: types.Message):
     """Rasmni qabul qilib, matnini aniqlaydi va tarjima qiladi."""
-    photo = message.photo[-1]
-    file_info = await bot.get_file(photo.file_id)
-    file_bytes_io = await bot.download_file(file_info.file_path)
+    image_bytes = await download_telegram_file(message.photo[-1].file_id)
+
+    if image_bytes is None:
+        await message.answer(
+            "⚠️ <b>Rasmni yuklab olishda xatolik.</b>\n"
+            "Rasm juda katta bo'lishi mumkin (20 MB dan ortiq) yoki aloqa uzilgan. "
+            "Qaytadan urinib ko'ring.",
+            reply_markup=get_main_menu_keyboard()
+        )
+        return
+
     caption = message.caption.strip() if message.caption else ""
-    await process_image_translation(message, file_bytes_io.getvalue(), caption)
+    await process_image_translation(message, image_bytes, caption)
 
 
 @dp.message(F.document)
 async def document_image_handler(message: types.Message):
     """Hujjat sifatida yuborilgan rasmlarni qabul qilib tarjima qiladi."""
     doc = message.document
-    if doc.mime_type and doc.mime_type.startswith("image/"):
-        file_info = await bot.get_file(doc.file_id)
-        file_bytes_io = await bot.download_file(file_info.file_path)
-        caption = message.caption.strip() if message.caption else ""
-        await process_image_translation(message, file_bytes_io.getvalue(), caption)
+
+    if not (doc.mime_type and doc.mime_type.startswith("image/")):
+        await message.answer(
+            "📄 <b>Bu turdagi faylni o'qiy olmayman.</b>\n\n"
+            "Hozircha faqat rasm (JPG, PNG) fayllarini tarjima qila olaman.\n"
+            "💡 Matnni to'g'ridan-to'g'ri xabar sifatida yuborsangiz ham bo'ladi.",
+            reply_markup=get_main_menu_keyboard()
+        )
+        return
+
+    image_bytes = await download_telegram_file(doc.file_id)
+
+    if image_bytes is None:
+        await message.answer(
+            "⚠️ <b>Faylni yuklab olishda xatolik.</b> Qaytadan urinib ko'ring.",
+            reply_markup=get_main_menu_keyboard()
+        )
+        return
+
+    caption = message.caption.strip() if message.caption else ""
+    await process_image_translation(message, image_bytes, caption)
 
 
 # ============================================================
@@ -3004,33 +3018,20 @@ async def video_handler(message: types.Message):
         caption_text = message.caption.strip()
         try:
             detected = await translator_detect(caption_text)
-            lang = detected.lang
+            lang = getattr(detected, "lang", "en") or "en"
 
-            user_pref = get_user_lang(message.from_user.id)
-            if user_pref != "auto":
-                destination = user_pref
-                if lang == destination:
-                    destination = "uz" if lang != "uz" else "en"
-            else:
-                if lang == "en":
-                    destination = "uz"
-                elif lang == "uz":
-                    destination = "en"
-                elif lang == "ru":
-                    destination = "uz"
-                else:
-                    destination = "en"
+            destination = choose_destination(lang, get_user_lang(message.from_user.id))
 
             result = await translator_translate(caption_text, destination)
 
-            lang_flags = {"en": "🇬🇧", "uz": "🇺🇿", "ru": "🇷🇺"}
-            src_flag = lang_flags.get(lang, "🌐")
-            dst_flag = lang_flags.get(destination, "🌐")
+            src_flag = GLOBAL_LANG_FLAGS.get(lang, "🌐")
+            dst_flag = GLOBAL_LANG_FLAGS.get(destination, "🌐")
 
             increment_search(message.from_user.id)
-            save_history(message.from_user.id, caption_text[:100], result.text[:100])
+            save_history(message.from_user.id, caption_text, result.text)
 
-            await message.answer(
+            await answer_long(
+                message,
                 f"🎥 <b>VIDEO MATNI TARJIMASI</b> {src_flag} → {dst_flag}\n\n"
                 f"📝 <b>Original:</b>\n{html.escape(caption_text)}\n\n"
                 "━━━━━━━━━━━━━━\n\n"
@@ -3073,7 +3074,7 @@ async def send_test_question(message: types.Message, user_id: int):
     idx = session["index"]
     questions = session["questions"]
     lang_code = session.get("lang", "en")
-    lang_title = TEST_LANG_NAMES.get(lang_code, "")
+    test_title = TEST_LANG_NAMES.get(lang_code, "")
 
     if idx >= len(questions):
         # Test yakunlandi!
@@ -3090,13 +3091,12 @@ async def send_test_question(message: types.Message, user_id: int):
         else:
             grade = "📚 Yana o'rganing! (Keep learning)"
 
-        del user_test_sessions[user_id]
-        if user_id in user_test_setup:
-            del user_test_setup[user_id]
+        user_test_sessions.pop(user_id, None)
+        user_test_setup.pop(user_id, None)
 
         await message.answer(
             f"🎉 <b>TEST YAKUNLANDI!</b>\n\n"
-            f"📌 Til: <b>{lang_title}</b>\n"
+            f"📌 Til: <b>{test_title}</b>\n"
             f"━━━━━━━━━━━━━━\n"
             f"📊 <b>Natijangiz:</b> {score}/{total} ({percent}%)\n"
             f"✅ <b>To'g'ri:</b> {score} ta\n"
@@ -3115,7 +3115,7 @@ async def send_test_question(message: types.Message, user_id: int):
         var_text += f"<b>{letters[i]})</b> {opt}\n"
 
     text = (
-        f"📝 <b>TEST: {lang_title} ({idx + 1}/{len(questions)})</b>\n\n"
+        f"📝 <b>TEST: {test_title} ({idx + 1}/{len(questions)})</b>\n\n"
         f"<b>{q['savol']}</b>\n\n"
         f"{var_text}\n"
         "👇 <i>To'g'ri javobni tanlang:</i>"
@@ -3131,10 +3131,10 @@ async def send_test_question(message: types.Message, user_id: int):
 @dp.message(F.text.in_({"⬅️ Asosiy menyu", "🏠 Menyu", "📋 Asosiy menyu", "Menyu"}))
 async def btn_main_menu(message: types.Message):
     # Agar test jarayonida bo'lsa to'xtatamiz
-    if message.from_user.id in user_test_sessions:
-        del user_test_sessions[message.from_user.id]
-    if message.from_user.id in user_test_setup:
-        del user_test_setup[message.from_user.id]
+    user_test_sessions.pop(message.from_user.id, None)
+    user_test_setup.pop(message.from_user.id, None)
+    user_test_locks.pop(message.from_user.id, None)
+
     await message.answer(
         "📋 <b>ASOSIY MENYU</b>\n\nKerakli bo'limni tanlang:",
         reply_markup=get_main_menu_keyboard()
@@ -3155,13 +3155,13 @@ async def btn_video_menu(message: types.Message):
     )
 
 
-@dp.message(F.text.in_({"📝 Test topshirish", "/test"}))
+@dp.message(Command("test"))
+@dp.message(F.text == "📝 Test topshirish")
 async def btn_start_test(message: types.Message):
     user_id = message.from_user.id
-    if user_id in user_test_sessions:
-        del user_test_sessions[user_id]
-    if user_id in user_test_setup:
-        del user_test_setup[user_id]
+    user_test_sessions.pop(user_id, None)
+    user_test_setup.pop(user_id, None)
+    user_test_locks.pop(user_id, None)
 
     await message.answer(
         "📝 <b>TEST TOPSHIRISH — QAYSI YO'NALISHDA TEST TOPSHIRMOQCHISIZ?</b>\n\n"
@@ -3192,10 +3192,10 @@ async def btn_select_test_lang(message: types.Message):
     }
     chosen_lang = lang_map.get(message.text, "en")
     user_test_setup[message.from_user.id] = {"lang": chosen_lang}
-    lang_title = TEST_LANG_NAMES.get(chosen_lang, chosen_lang)
+    test_title = TEST_LANG_NAMES.get(chosen_lang, chosen_lang)
 
     await message.answer(
-        f"🎯 <b>{lang_title} tanlandi!</b>\n\n"
+        f"🎯 <b>{test_title} tanlandi!</b>\n\n"
         "Nechta savoldan iborat test topshirmoqchisiz?\n"
         "Quyidagi variantlardan birini tanlang:",
         reply_markup=get_test_count_keyboard()
@@ -3244,9 +3244,9 @@ async def btn_select_test_count(message: types.Message):
         "total": sample_count
     }
 
-    lang_title = TEST_LANG_NAMES.get(lang_code, lang_code)
+    test_title = TEST_LANG_NAMES.get(lang_code, lang_code)
     await message.answer(
-        f"🚀 <b>{lang_title} TESTI BOSHLANDI!</b>\n\n"
+        f"🚀 <b>{test_title} TESTI BOSHLANDI!</b>\n\n"
         f"📌 Jami: <b>{sample_count} ta savol</b>\n"
         "Har bir savolga to'g'ri variantni (A, B, C, D) tanlang.\n"
         "Omad tilaymiz! 🍀"
@@ -3258,21 +3258,22 @@ async def btn_select_test_count(message: types.Message):
 @dp.message(F.text == "❌ Testni to'xtatish")
 async def btn_cancel_test(message: types.Message):
     user_id = message.from_user.id
-    if user_id in user_test_sessions:
-        del user_test_sessions[user_id]
-    if user_id in user_test_setup:
-        del user_test_setup[user_id]
+    user_test_sessions.pop(user_id, None)
+    user_test_setup.pop(user_id, None)
+    user_test_locks.pop(user_id, None)
     await message.answer("❌ Test to'xtatildi.", reply_markup=get_main_menu_keyboard())
 
 
-user_test_locks = {}
 
 
 @dp.message(F.text.regexp(r"^[ABCDabcd]\)\s|^([ABCDabcd]\)?)$"))
 async def btn_test_answer(message: types.Message):
     user_id = message.from_user.id
     session = user_test_sessions.get(user_id)
+
     if not session:
+        # Test yo'q — demak bu oddiy matn ("A", "B) ..."), uni tarjima qilamiz
+        await translate_message(message)
         return
 
     # Foydalanuvchi tez-tez yoki ikki marta bosganda race condition bo'lmasligi uchun lock
@@ -3338,21 +3339,18 @@ async def btn_test_answer(message: types.Message):
         session["index"] += 1
         await send_test_question(message, user_id)
 
+    # Test tugagan bo'lsa, foydalanuvchining lock obyektini ham tozalaymiz
+    if user_id not in user_test_sessions:
+        user_test_locks.pop(user_id, None)
+
 
 @dp.message(F.text == "🌐 Tarjima tili")
 async def btn_lang_menu(message: types.Message):
-    current = get_user_lang(message.from_user.id)
-    lang_names = {
-        "auto": "🔄 Avtomatik",
-        "uz": "🇺🇿 O'zbekcha",
-        "en": "🇬🇧 English",
-        "ru": "🇷🇺 Русский",
-        "ko": "🇰🇷 한국어 (Koreys)",
-        "tr": "🇹🇷 Türkçe (Turk)",
-    }
+    current_name = lang_title(get_user_lang(message.from_user.id))
+
     await message.answer(
         "🌐 <b>TIL SOZLAMALARI</b>\n\n"
-        f"Hozirgi maqsad til: <b>{lang_names.get(current, '🔄 Avtomatik')}</b>\n\n"
+        f"Hozirgi maqsad til: <b>{current_name}</b>\n\n"
         "Tarjima qilish tilini tanlang:\n"
         "• <b>Avtomatik</b> — til avtomatik aniqlanadi\n"
         "• <b>O'zbekcha</b> — hammasi o'zbekchaga tarjima qilinadi\n"
@@ -3364,20 +3362,24 @@ async def btn_lang_menu(message: types.Message):
     )
 
 
-@dp.message(F.text.in_({"🔄 Avtomatik", "🇺🇿 O'zbekcha", "🇬🇧 English", "🇷🇺 Русский", "🇰🇷 한국어 (Koreys)", "🇹🇷 Türkçe (Turk)"}))
+# Reply tugma matni -> til kodi
+REPLY_LANG_MAP = {
+    "🔄 Avtomatik": "auto",
+    "🇺🇿 O'zbekcha": "uz",
+    "🇬🇧 English": "en",
+    "🇷🇺 Русский": "ru",
+    "🇰🇷 한국어 (Koreys)": "ko",
+    "🇹🇷 Türkçe (Turk)": "tr",
+}
+
+
+@dp.message(F.text.in_(set(REPLY_LANG_MAP.keys())))
 async def btn_set_lang(message: types.Message):
-    lang_map = {
-        "🔄 Avtomatik": "auto",
-        "🇺🇿 O'zbekcha": "uz",
-        "🇬🇧 English": "en",
-        "🇷🇺 Русский": "ru",
-        "🇰🇷 한국어 (Koreys)": "ko",
-        "🇹🇷 Türkçe (Turk)": "tr"
-    }
-    lang = lang_map.get(message.text, "auto")
+    lang = REPLY_LANG_MAP.get(message.text, "auto")
     set_user_lang(message.from_user.id, lang)
+
     await message.answer(
-        f"✅ <b>Tarjima tili o'zgartirildi:</b> {message.text}\n\n"
+        f"✅ <b>Tarjima tili o'zgartirildi:</b> {lang_title(lang)}\n\n"
         "Endi yuborganingiz shu tilga tarjima qilinadi.",
         reply_markup=get_main_menu_keyboard()
     )
@@ -3393,84 +3395,40 @@ async def btn_kutubxona(message: types.Message):
 
 @dp.message(F.text.in_(set(KUTUBXONA.keys())))
 async def btn_kutubxona_category(message: types.Message):
-    category = message.text
-    books = KUTUBXONA.get(category, [])
-    if not books:
-        await message.answer("Kitoblar topilmadi.")
-        return
-
-    text = f"📚 <b>{html.escape(category)}</b>\n\n"
-    for i, book in enumerate(books, 1):
-        text += (
-            f"<b>{i}. {html.escape(book['nom'])}</b>\n"
-            f"✍️ {html.escape(book['muallif'])}\n"
-            f"📝 <i>{html.escape(book['tavsif'])}</i>\n\n"
-        )
-    await message.answer(text, reply_markup=get_kutubxona_keyboard())
+    await answer_long(
+        message,
+        build_books_text(message.text),
+        reply_markup=get_kutubxona_keyboard()
+    )
 
 
 @dp.message(F.text == "💡 Fakt")
 async def btn_fakt_info(message: types.Message):
-    fakt = random.choice(FAKTLAR)
     await message.answer(
-        f"💡 <b>QIZIQARLI FAKT</b>\n\n{fakt}",
+        build_fakt_text(),
         reply_markup=get_main_menu_keyboard()
     )
 
 
 @dp.message(F.text == "🔥 Motivatsiya")
 async def btn_motivatsiya_quote(message: types.Message):
-    quote = random.choice(MOTIVATSIYA_QUOTES)
     await message.answer(
-        f"🔥 <b>MOTIVATSIYA</b>\n\n"
-        f"💬 <i>\"{html.escape(quote['quote'])}\"</i>\n\n"
-        f"— <b>{html.escape(quote['muallif'])}</b>\n\n"
-        "━━━━━━━━━━━━━━\n\n"
-        f"🇺🇿 {html.escape(quote['tarjima'])}",
+        build_motivatsiya_text(),
         reply_markup=get_main_menu_keyboard()
     )
 
 
 @dp.message(F.text == "🧮 Matematik")
 async def btn_matematik_problem(message: types.Message):
-    data = generate_math_problem_with_options()
-    user_math_sessions[message.from_user.id] = data
-
-    await message.answer(
-        "🧮 <b>MATEMATIK MASALA</b>\n\n"
-        f"❓ <code>{data['problem']}</code>\n\n"
-        f"A) {data['options'][0]}\n"
-        f"B) {data['options'][1]}\n"
-        f"C) {data['options'][2]}\n\n"
-        "👇 <i>To'g'ri javobni tanlang:</i>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text=f"A) {data['options'][0]}", callback_data=f"math_choice_0_{data['correct_idx']}"),
-                InlineKeyboardButton(text=f"B) {data['options'][1]}", callback_data=f"math_choice_1_{data['correct_idx']}"),
-            ],
-            [
-                InlineKeyboardButton(text=f"C) {data['options'][2]}", callback_data=f"math_choice_2_{data['correct_idx']}"),
-            ],
-            [
-                InlineKeyboardButton(text="🧮 Yangi masala", callback_data="menu_matematik"),
-                InlineKeyboardButton(text="⬅️ Menyu", callback_data="back_main"),
-            ],
-        ])
-    )
+    text, keyboard = build_math_message(message.from_user.id)
+    await message.answer(text, reply_markup=keyboard)
 
 
 @dp.message(F.text == "🌤 Ob-havo")
 async def btn_weather_menu(message: types.Message):
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🌤 @Obb_hovo_Bot ga o'tish", url="https://t.me/Obb_hovo_Bot")
-        ]
-    ])
     await message.answer(
-        "🌤 <b>OB-HAVO MA'LUMOTLARI</b>\n\n"
-        "O'zbekistonning barcha 12 ta viloyati va dunyo shaharlari bo'yicha eng aniq ob-havo ma'lumotlarini olish uchun quyidagi tugma orqali rasmiy botimizga o'ting:\n\n"
-        "👉 @Obb_hovo_Bot",
-        reply_markup=markup
+        WEATHER_INTRO_TEXT,
+        reply_markup=get_weather_keyboard()
     )
 
 
@@ -3497,6 +3455,12 @@ async def btn_help_info(message: types.Message):
 
 @dp.message(F.text == "📷 Rasm tarjima")
 async def btn_photo_info(message: types.Message):
+    ocr_status = (
+        "✅ <b>OCR tizimi faol va tayyor!</b>"
+        if OCR_AVAILABLE
+        else "⚠️ <b>OCR hozircha o'chiq</b> — rasmga izoh (caption) yozib yuboring."
+    )
+
     await message.answer(
         "📷 <b>RASM TARJIMA TIZIMI</b>\n\n"
         "Rasmda matn bormi? Menga yuboring!\n\n"
@@ -3504,7 +3468,7 @@ async def btn_photo_info(message: types.Message):
         "1️⃣ Matni bor istalgan rasmni to'g'ridan-to'g'ri botga yuboring.\n"
         "2️⃣ Bot rasmdagi matnni sun'iy intellekt (OCR) orqali o'qiydi.\n"
         "3️⃣ So'ngra Google Translate orqali uni o'zbek yoki boshqa tilga tarjima qiladi!\n\n"
-        "✅ <b>OCR tizimi faol va tayyor!</b>\n"
+        f"{ocr_status}\n"
         "💡 <i>Shuningdek, rasmni yuborib tagiga izoh (caption) yozsangiz, bot izohni ham bir zumda tarjima qiladi.</i>",
         reply_markup=get_main_menu_keyboard()
     )
@@ -3562,82 +3526,94 @@ async def btn_alphabet_selected(message: types.Message):
     await message.answer(info, reply_markup=get_alphabet_keyboard())
 
 
+# Reply tugma matni -> quiz kategoriya kaliti
+REPLY_QUIZ_CATEGORY_MAP = {
+    f"{name} ({start + 1}-{end})": key
+    for key, (name, start, end) in QUIZ_CATEGORIES.items()
+}
+
+
 @dp.message(F.text.in_({"📝 Quiz / Savol", "🎲 Quiz / Savol"}))
 async def btn_quiz_menu_open(message: types.Message):
+    categories_text = "\n".join(
+        f"• {name} ({start + 1}-{end})"
+        for name, start, end in QUIZ_CATEGORIES.values()
+    )
+
     await message.answer(
-        "📝 <b>QUIZ — TIL VA BILIM VIKTORINASI</b>\n\n"
-        "Jami 60 ta qiziqarli savol:\n"
-        "• 🔤 So'z tarjimasi (1-12)\n"
-        "• 📖 Grammatika (13-24)\n"
-        "• 📚 So'z boyligi (25-36)\n"
-        "• 🧠 Mantiqiy savollar (37-48)\n"
-        "• 🌍 Dunyoqarash & Fan (49-60)\n\n"
+        "🎲 <b>QUIZ — TIL VA BILIM VIKTORINASI</b>\n\n"
+        f"Jami {len(QUIZ_QUESTIONS)} ta qiziqarli savol:\n"
+        f"{categories_text}\n\n"
         "Kategoriyani tanlang:",
         reply_markup=get_quiz_keyboard()
     )
 
 
-@dp.message(F.text.in_({
-    "🎲 Tasodifiy savol",
-    "🔤 So'z tarjimasi (1-12)",
-    "📖 Grammatika (13-24)",
-    "📚 So'z boyligi (25-36)",
-    "🧠 Mantiqiy savollar (37-48)",
-    "🌍 Dunyoqarash & Fan (49-60)",
-}))
+@dp.message(F.text.in_({"🎲 Tasodifiy savol"} | set(REPLY_QUIZ_CATEGORY_MAP.keys())))
 async def btn_quiz_question_show(message: types.Message):
-    cat = message.text
-    if cat == "🎲 Tasodifiy savol":
-        q_index = random.randint(0, len(QUIZ_QUESTIONS) - 1)
-    elif "1-12" in cat:
-        q_index = random.randint(0, 11)
-    elif "13-24" in cat:
-        q_index = random.randint(12, 23)
-    elif "25-36" in cat:
-        q_index = random.randint(24, 35)
-    elif "37-48" in cat:
-        q_index = random.randint(36, 47)
-    elif "49-60" in cat:
-        q_index = random.randint(48, 59)
+    """Savolni variantlari bilan yuboradi — javobni foydalanuvchi o'zi tanlaydi."""
+    key = REPLY_QUIZ_CATEGORY_MAP.get(message.text)
+
+    if key:
+        _, start, end = QUIZ_CATEGORIES[key]
+        q_index = random.randrange(start, min(end, len(QUIZ_QUESTIONS)))
     else:
-        q_index = random.randint(0, len(QUIZ_QUESTIONS) - 1)
+        q_index = random.randrange(len(QUIZ_QUESTIONS))
 
-    q = QUIZ_QUESTIONS[q_index]
-    correct = q['javob']
-    text = (
-        f"📝 <b>SAVOL {q_index + 1}/{len(QUIZ_QUESTIONS)}</b>\n\n"
-        f"{q['savol']}\n\n"
-    )
-    for i, variant in enumerate(q['variantlar']):
-        letter = chr(65 + i)
-        text += f"<b>{letter})</b> {variant}\n"
-
-    text += (
-        f"\n💡 <b>To'g'ri javob:</b> <b>{chr(65 + correct)}) {q['variantlar'][correct]}</b>\n\n"
-        f"📖 <i>{q['tushuntirish']}</i>"
-    )
-    await message.answer(text, reply_markup=get_quiz_keyboard())
+    text, keyboard = build_quiz_message(q_index)
+    await message.answer(text, reply_markup=keyboard)
 
 
 # ============================================================
 # MAIN MESSAGE — TARJIMA (EN/UZ/RU)
 # ============================================================
 
-@dp.message()
-async def translate_message(
-    message: types.Message
-):
+MAX_TRANSLATE_LENGTH = 3000
 
-    text = message.text
+
+async def send_plain_translation(
+    message: types.Message,
+    text: str,
+    destination: str,
+    src_flag: str,
+    dst_flag: str,
+    src_name: str,
+    dst_name: str,
+) -> None:
+    """Matnni tarjima qilib, natijani yuboradi va tarixga yozadi."""
+    result = await translator_translate(text, destination)
+    translated_text = getattr(result, "text", str(result))
+
+    increment_search(message.from_user.id)
+    save_history(message.from_user.id, text, translated_text)
+
+    await answer_long(
+        message,
+        f"🌐 <b>TARJIMA</b> {src_flag} → {dst_flag}\n"
+        f"<i>{src_name} → {dst_name}</i>\n\n"
+        f"📝 <b>Original:</b>\n"
+        f"{html.escape(text)}\n\n"
+        "━━━━━━━━━━━━━━\n\n"
+        f"🔄 <b>Tarjima:</b>\n"
+        f"{html.escape(translated_text)}"
+    )
+
+
+@dp.message()
+async def translate_message(message: types.Message):
+
+    text = (message.text or "").strip()
 
     if not text:
-
         return
 
-    text = text.strip()
-
-    if not text:
-
+    if len(text) > MAX_TRANSLATE_LENGTH:
+        await message.answer(
+            f"⚠️ <b>Matn juda uzun.</b>\n\n"
+            f"Bir marta {MAX_TRANSLATE_LENGTH} belgigacha tarjima qila olaman "
+            f"(siz {len(text)} belgi yubordingiz).\n"
+            "Iltimos, matnni qismlarga bo'lib yuboring."
+        )
         return
 
     register_user(
@@ -3671,23 +3647,7 @@ async def translate_message(
         # ==================================================
 
         user_pref = get_user_lang(message.from_user.id)
-
-        if user_pref != "auto":
-            # Foydalanuvchi o'zi tanlagan tilga tarjima
-            destination = user_pref
-            # Agar manba va maqsad tili bir xil bo'lsa
-            if lang == destination:
-                destination = "en" if destination == "uz" else "uz"
-        else:
-            # Avtomatik rejim
-            if lang == "uz":
-                destination = "en"
-            elif lang == "en":
-                destination = "uz"
-            elif lang in ("ru", "ko", "tr", "de", "fr", "ar", "ja", "zh", "es"):
-                destination = "uz"
-            else:
-                destination = "uz"
+        destination = choose_destination(lang, user_pref)
 
         src_flag = GLOBAL_LANG_FLAGS.get(lang, "🌐")
         dst_flag = GLOBAL_LANG_FLAGS.get(destination, "🌐")
@@ -3695,54 +3655,31 @@ async def translate_message(
         dst_name = GLOBAL_LANG_NAMES.get(destination, destination.upper())
 
         # ==================================================
-        # DIRECT TRANSLATION (user_pref != auto, gap yoki inglizcha bo'lmagan so'z)
+        # TO'G'RIDAN-TO'G'RI TARJIMA
+        # (til tanlangan, gap uzun yoki matn inglizcha emas)
         # ==================================================
 
         if user_pref != "auto" or len(text.split()) > 2 or lang != "en":
-            result = await translator_translate(text, destination)
-            translated_text = getattr(result, "text", str(result))
-
-            increment_search(message.from_user.id)
-            save_history(message.from_user.id, text, translated_text)
-
-            await message.answer(
-                f"🌐 <b>TARJIMA</b> {src_flag} → {dst_flag}\n"
-                f"<i>{src_name} → {dst_name}</i>\n\n"
-                f"📝 <b>Original:</b>\n"
-                f"{html.escape(text)}\n\n"
-                "━━━━━━━━━━━━━━\n\n"
-                f"🔄 <b>Tarjima:</b>\n"
-                f"{html.escape(translated_text)}"
+            await send_plain_translation(
+                message, text, destination, src_flag, dst_flag, src_name, dst_name
             )
             return
 
         # ==================================================
-        # SINGLE ENGLISH WORD — OXFORD DICTIONARY LOOKUP
+        # BITTA INGLIZCHA SO'Z — LUG'AT (dictionaryapi.dev)
         # ==================================================
 
-        word = text.strip()
+        word = text
         lookup = await asyncio.to_thread(getDefinitions, word)
 
         if not lookup:
             # So'z lug'atda topilmasa oddiy tarjima
-            result = await translator_translate(text, destination)
-            translated_text = getattr(result, "text", str(result))
-
-            increment_search(message.from_user.id)
-            save_history(message.from_user.id, text, translated_text)
-
-            await message.answer(
-                f"🌐 <b>TARJIMA</b> {src_flag} → {dst_flag}\n"
-                f"<i>{src_name} → {dst_name}</i>\n\n"
-                f"📝 <b>Original:</b>\n"
-                f"{html.escape(text)}\n\n"
-                "━━━━━━━━━━━━━━\n\n"
-                f"🔄 <b>Tarjima:</b>\n"
-                f"{html.escape(translated_text)}"
+            await send_plain_translation(
+                message, text, destination, src_flag, dst_flag, src_name, dst_name
             )
             return
 
-        # Oxford lug'at topildi
+        # Lug'atda topildi
         increment_search(message.from_user.id)
         real_word = lookup.get("word", word)
         phonetic = lookup.get("phonetic")
@@ -3785,7 +3722,7 @@ async def translate_message(
         if antonyms:
             response += f"\n🚫 <b>ANTONYMS</b>\n\n{', '.join(map(html.escape, antonyms[:15]))}\n"
 
-        await message.answer(response)
+        await answer_long(message, response)
 
         if audio:
             try:
@@ -3794,15 +3731,11 @@ async def translate_message(
             except Exception as audio_error:
                 logger.warning("Audio yuborilmadi: %s", audio_error)
 
-        save_history(message.from_user.id, text, real_word)
-
+        save_history(message.from_user.id, text, f"{real_word}: {uz_text}")
 
     except Exception as error:
 
-        logger.exception(
-            "Message processing error: %s",
-            error
-        )
+        logger.exception("Xabarni qayta ishlashda xatolik: %s", error)
 
         await message.answer(
             "⚠️ <b>Kutilmagan xatolik yuz berdi.</b>\n\n"
@@ -3815,21 +3748,56 @@ async def translate_message(
 # START BOT
 # ============================================================
 
+@dp.errors()
+async def global_error_handler(event, exception: Exception) -> bool:
+    """
+    Handler ichida ushlanmagan xatolik butun botni to'xtatib qo'ymasligi uchun
+    markaziy xato ushlagich.
+    """
+    logger.exception("Handler xatosi: %s", exception)
+    return True
+
+
+def setup_shutdown_signals() -> None:
+    """
+    SIGTERM/SIGINT kelganda pollingni to'xtatadi.
+
+    Railway kabi platformalar konteynerni to'xtatishdan oldin SIGTERM
+    yuboradi — shu signalni ushlamasak, saqlanmagan ma'lumot yo'qoladi.
+    """
+    loop = asyncio.get_running_loop()
+
+    def _request_stop(sig_name: str) -> None:
+        logger.info("⏹ %s signali keldi — bot to'xtatilmoqda...", sig_name)
+        asyncio.create_task(dp.stop_polling())
+
+    for sig_name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, _request_stop, sig_name)
+        except NotImplementedError:
+            # Windows'da add_signal_handler qo'llab-quvvatlanmaydi —
+            # u yerda KeyboardInterrupt orqali to'xtaydi.
+            pass
+
+
 async def main():
 
-    init_database()
+    init_storage()
 
-    logger.info(
-        "======================================"
-    )
+    logger.info("======================================")
+    logger.info("🤖 SUPER TARJIMON BOT ISHGA TUSHMOQDA...")
+    logger.info("📚 Savollar: %d ta quiz, %d ta test yo'nalishi",
+                len(QUIZ_QUESTIONS), len(TEST_QUESTIONS))
+    logger.info("🖼 OCR: %s", "faol" if OCR_AVAILABLE else "o'chiq")
+    logger.info("======================================")
 
-    logger.info(
-        "🤖 SUPER TARJIMON BOT ISHGA TUSHMOQDA..."
-    )
+    setup_shutdown_signals()
 
-    logger.info(
-        "======================================"
-    )
+    # Ma'lumotlarni fonda vaqti-vaqti bilan diskka yozib turadi
+    autosave_task = asyncio.create_task(autosave_loop())
 
     try:
 
@@ -3845,7 +3813,7 @@ async def main():
             BotCommand(command="alfabit", description="9ta til alifbosi EN,RU,KO,TR,UZ,AR,DE,FR,JA"),
             BotCommand(command="test", description="Fan va til testlari 20-100"),
             BotCommand(command="matematik", description="Matematik masalalar A,B,C"),
-            BotCommand(command="obhavo", description="12 ta viloyat ob-havosi"),
+            BotCommand(command="obhavo", description="Shaharlar ob-havosi"),
             BotCommand(command="quiz", description="Til o'rganish viktorinasi"),
             BotCommand(command="kutubxona", description="Foydali kitoblar 9ta kategoriya"),
             BotCommand(command="fakt", description="Qiziqarli faktlar"),
@@ -3872,12 +3840,28 @@ async def main():
                 retry_delay = min(retry_delay * 2, 30)
     finally:
 
+        # Avtosaqlashni to'xtatamiz (u bekor qilinganda oxirgi marta saqlaydi)
+        autosave_task.cancel()
+        try:
+            await autosave_task
+        except asyncio.CancelledError:
+            pass
+
+        # Kafolat uchun yana bir marta saqlaymiz
+        await asyncio.to_thread(flush_storage)
+
         await bot.session.close()
+        logger.info("👋 Bot to'xtatildi, ma'lumotlar saqlandi.")
+
+
 # ============================================================
 # ENTRY POINT
 # ============================================================
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot to'xtatildi.")
+        # Ctrl+C bosilganda saqlanmagan ma'lumot yo'qolmasin
+        flush_storage()
+        logger.info("👋 Bot to'xtatildi.")

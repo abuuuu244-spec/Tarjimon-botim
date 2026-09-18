@@ -1,0 +1,23 @@
+# ============================================================
+# Railway (railway.com) uchun konfiguratsiya
+#
+# Bot — "worker" turidagi xizmat: u HTTP port ochmaydi, faqat
+# Telegram'dan yangiliklarni so'rab turadi (long polling).
+#
+# MUHIM: Telegram bitta bot uchun faqat BITTA getUpdates ulanishiga
+# ruxsat beradi. Shuning uchun replicas = 1 bo'lishi shart, aks holda
+# "Conflict: terminated by other getUpdates request" xatosi chiqadi.
+# ============================================================
+
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "python main.py"
+
+# Xatolik bilan to'xtasa qayta ishga tushirsin
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+# Bitta nusxada ishlashi SHART (yuqoridagi izohga qarang)
+numReplicas = 1

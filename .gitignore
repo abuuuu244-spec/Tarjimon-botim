@@ -1,0 +1,71 @@
+# ============================================================
+# Muhit o'zgaruvchilari — token hech qachon repoga tushmasin!
+# ============================================================
+.env
+.env.*
+!.env.example
+
+# ============================================================
+# Foydalanuvchi ma'lumotlari (JSON ombor)
+# ============================================================
+data/*.json
+data/*.json.tmp
+data/*.json.broken
+data/backups/
+!data/.gitkeep
+
+# ============================================================
+# Eski SQLite bazasi (loyiha JSON'ga o'tgan, endi ishlatilmaydi)
+# ============================================================
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Virtual muhitlar
+.venv/
+venv/
+env/
+ENV/
+
+# Test / lint keshlari
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ============================================================
+# IDE va OS fayllari
+# ============================================================
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# ============================================================
+# Loglar va vaqtinchalik fayllar
+# ============================================================
+*.log
+logs/
+tmp/
+temp/
+
+# OCR modellari keshi (avtomatik yuklab olinadi)
+.cache/
+*.onnx

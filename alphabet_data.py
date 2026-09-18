@@ -267,7 +267,7 @@ ALPHABET_DATA = {
         "• <b>Xx</b> [iks] — <i>Taxi</i> (Taksi)\n"
         "• <b>Yy</b> [ypsilon] — <i>System</i> (Tizim)\n"
         "• <b>Zz</b> [tset — har doim 'ts' o'qiladi] — <i>Zeit</i> (Vaqt)\n\n"
-        "🟡 <b>Maxsus harflar (Umlaute & Eszett):</b>\n"
+        "🟡 <b>Maxsus harflar (Umlaute &amp; Eszett):</b>\n"
         "• <b>Ä ä</b> [e / ae] — <i>Äpfel</i> (Olmalar)\n"
         "• <b>Ö ö</b> [yumshoq o'] — <i>Öl</i> (Yog')\n"
         "• <b>Ü ü</b> [yumshoq u'] — <i>Über</i> (Haqida/Ustida)\n"
@@ -318,7 +318,7 @@ ALPHABET_DATA = {
     ),
 
     "ja": (
-        "🇯🇵 <b>YAPON TILI ALIFBOSI (HIRAGANA & KATAKANA)</b>\n\n"
+        "🇯🇵 <b>YAPON TILI ALIFBOSI (HIRAGANA &amp; KATAKANA)</b>\n\n"
         "Yapon tilida 3 xil yozuv turi mavjud: <b>Hiragana</b> (sof yapon so'zlari va grammatika), <b>Katakana</b> (chet tilidan kirgan so'zlar) va <b>Kanji</b> (ierogliflar).\n\n"
         "🔴 <b>HIRAGANA (ひらがな - 46 ta asosiy bo'g'in):</b>\n"
         "• <b>あ (a)</b> | <b>い (i)</b> | <b>う (u)</b> | <b>え (e)</b> | <b>お (o)</b>\n"
